@@ -1,0 +1,19 @@
+#
+# Sample configuration file for the crdss server.
+#
+[SERVER]
+    addr = 10.10.10.10
+port = 5067
+loglevel = debug
+secret = server
+devices = /dev/nvme0n1 /dev/nvme2n4
+
+[SNIC]
+    addr   = 1.2.3.4
+    port   = 1024
+    secret = bla
+
+[SNIC]
+    addr   = 2.3.4.5
+    port   = 54321
+    secret = blubb

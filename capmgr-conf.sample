@@ -1,0 +1,30 @@
+#
+# Sample configuration file for the crdss cap manager.
+#
+[GLOBAL]
+    addr = 10.10.10.2
+loglevel = debug
+    secret = bla
+    domsock = /tmp/crdss-capmgr.sock
+
+[SERVER]
+    addr   = 10.10.10.1
+    port   = 5050
+    lport  = 6000
+    secret = srv
+
+#[SERVER]
+#    addr   = 2.3.4.5
+#    port   = 54321
+#    lport  = 6010
+#    secret = veryverysecret
+
+[CAP]
+    server     = 10.10.10.1
+    dev_idx    = 0
+    vslc_idx   = 0
+    start_addr = 0
+    end_addr   = 10
+    rights     = read write
+    uid        = 1234
+    key        = generic
