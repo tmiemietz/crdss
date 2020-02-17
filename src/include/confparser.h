@@ -84,7 +84,7 @@ struct snic_config {
 
 /* structure that describes config of client library (buffer sizes etc.)    */
 struct clt_lib_cfg {
-    unsigned int no_workers;    /* number of worker threads expected        */
+    uint16_t no_workers;        /* number of worker threads expected        */
 
     size_t sbuf_size;           /* size of small buffers in bytes (static   *
                                  * allocation to one worker thread, lib     *

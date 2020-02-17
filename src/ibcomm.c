@@ -20,6 +20,7 @@
 #include <string.h>                         /* memset and friends           */
 #include <infiniband/verbs.h>               /* IB communication definitions */
 #include <errno.h>                          /* find out reasons for errors  */
+#include <arpa/inet.h>                      /* byte order conversion        */
 
 #include "include/ibcomm.h"                 /* header for ibcomm impl.      */
 #include "include/protocol.h"               /* to compute size of msg bufs  */
@@ -136,15 +137,16 @@ static int get_ctx_by_guid(struct ib_ctx *ibctx, uint64_t guid) {
 
 /* Initiates an InfiniBand RC queue pair on client side.                    */
 int init_clt_qp(struct ib_ctx *ibctx, uint64_t guid, unsigned char **msgbuf, 
-                unsigned char **rdmabuf, int rdmasz) {
+                uint32_t msg_cnt, unsigned char **rdmabuf, uint32_t rdmasize) {
     struct ibv_qp_init_attr iattr;      /* attributes for initializing a    *
                                          * queue pair                       */
 
     /* first of all, allocate the message buffers. If this fails, we don't  *
      * even have to bother with any further actions                         */
-    /* msg buffer for both send and recv (hence * 2)                        */
-    *msgbuf  = malloc(RBUF_MSG_CNT * 2 * MAX_MSG_LEN);
-    *rdmabuf = malloc(rdmasz);
+    /* memory is allocated only for receive / completion messages since     *
+     * sending of small messages is always done using inline data           */
+    *msgbuf  = malloc(msg_cnt * MAX_MSG_LEN);
+    *rdmabuf = malloc(rdmasize);
 
     if (*msgbuf == NULL || *rdmabuf == NULL) {
         logmsg(ERROR, "Allocation of InfiniBand message buffers failed!");
@@ -179,11 +181,10 @@ int init_clt_qp(struct ib_ctx *ibctx, uint64_t guid, unsigned char **msgbuf,
     /* register memory regions for send / receive buffer areas as well as for*
      * the rdma data transfer areas, we will only use RDMA write so nor      *
      * IBV_ACCESS_REMOTE_READ flag has to be set                             */
-    ibctx->msg_mr = ibv_reg_mr(ibctx->pdom, *msgbuf, 
-                               RBUF_MSG_CNT * 2 * MAX_MSG_LEN,
+    ibctx->msg_mr = ibv_reg_mr(ibctx->pdom, *msgbuf, msg_cnt * MAX_MSG_LEN,
                                IBV_ACCESS_LOCAL_WRITE | 
                                IBV_ACCESS_REMOTE_WRITE);
-    ibctx->rdma_mr = ibv_reg_mr(ibctx->pdom, *rdmabuf, rdmasz,
+    ibctx->rdma_mr = ibv_reg_mr(ibctx->pdom, *rdmabuf, rdmasize,
                                IBV_ACCESS_LOCAL_WRITE |
                                IBV_ACCESS_REMOTE_WRITE);
     if (ibctx->msg_mr == NULL || ibctx->rdma_mr == NULL) {
@@ -203,7 +204,7 @@ int init_clt_qp(struct ib_ctx *ibctx, uint64_t guid, unsigned char **msgbuf,
     }
 
     /* create a completion queue, maybe investigate on the IRQ vector later */
-    ibctx->cq = ibv_create_cq(ibctx->dev_ctx, 2 * RBUF_MSG_CNT, NULL,
+    ibctx->cq = ibv_create_cq(ibctx->dev_ctx, msg_cnt, NULL,
                               ibctx->cchannel, 0);
     if (ibctx->cq == NULL)
         goto err_cq;
@@ -214,9 +215,9 @@ int init_clt_qp(struct ib_ctx *ibctx, uint64_t guid, unsigned char **msgbuf,
     iattr.recv_cq    = ibctx->cq;
     iattr.srq        = NULL;            /* no SRQ usage for now             */
     
-    iattr.cap.max_send_wr  = RBUF_MSG_CNT;  /* max outstanding send reqs.   */
-    iattr.cap.max_recv_wr  = RBUF_MSG_CNT;  /* max outstanding recv reqs.   */
-    iattr.cap.max_send_sge = MAX_SGE;       /* see ibcomm.h                 */
+    iattr.cap.max_send_wr  = msg_cnt;   /* max outstanding send reqs.       */
+    iattr.cap.max_recv_wr  = msg_cnt;   /* max outstanding recv reqs.       */
+    iattr.cap.max_send_sge = MAX_SGE;   /* see ibcomm.h                     */
     iattr.cap.max_recv_sge = MAX_SGE;
     /* ctrl messages are small, so they might be sent inline... */
     iattr.cap.max_inline_data = MAX_MSG_LEN;
@@ -231,6 +232,10 @@ int init_clt_qp(struct ib_ctx *ibctx, uint64_t guid, unsigned char **msgbuf,
         logmsg(ERROR, "Queue pair creation failed.");
         goto err_qp;
     }
+
+    /* save the number of messages that the message buffer can hold at once *
+     * (each of them is MAX_MSG_LEN in size)                                */
+    ibctx->msg_cnt = msg_cnt;
 
     /* we have done the basic (!) setup of an IB connection... */
     return(0);
@@ -273,7 +278,7 @@ int complete_clt_qp(struct ib_ctx *ibctx, unsigned char *msg_buf) {
     /* INIT to RTR */
     /* second hald of message buffer is reserved for receive requests, need *
      * to post some before switching to RTR state                           */
-    if (post_msg_rr(ibctx, msg_buf + RBUF_MSG_CNT * MAX_MSG_LEN, RBUF_MSG_CNT)){
+    if (post_msg_rr(ibctx, msg_buf, ibctx->msg_cnt)){
         logmsg(ERROR, "Unable to register initial receive requests...");
         return(1);
     }
@@ -326,7 +331,7 @@ int complete_clt_qp(struct ib_ctx *ibctx, unsigned char *msg_buf) {
 
 /* Sets up a InfiniBand queue pair on the server side.                      */
 int setup_srv_qp(struct ib_ctx *ibctx, uint64_t guid, unsigned char **msgbuf,            
-                 unsigned char **databuf, uint32_t rdmasz) {
+                 uint32_t msg_cnt, unsigned char **databuf, uint32_t rdmasz) {
     
     /* check size of requested memory window for data transfer */
     if (rdmasz > MAX_SRV_BUF_SZ) {
@@ -335,8 +340,14 @@ int setup_srv_qp(struct ib_ctx *ibctx, uint64_t guid, unsigned char **msgbuf,
         return(1);
     }
 
+    if (msg_cnt > MAX_SRV_MSG_QD) {
+        logmsg(ERROR, "SEND/RECV queue depth (%u) exceeds limit (%u).",
+              msg_cnt, MAX_SRV_MSG_QD);
+        return(1);
+    }
+
     /* fortunately, we can recycle the functions used for client setup...   */
-    if (init_clt_qp(ibctx, guid, msgbuf, databuf, rdmasz) != 0) {
+    if (init_clt_qp(ibctx, guid, msgbuf, msg_cnt, databuf, rdmasz) != 0) {
         logmsg(ERROR, "Queue pair initialization failed.");
         return(1);
     }
@@ -407,7 +418,7 @@ int post_msg_rr(struct ib_ctx *ibctx, unsigned char *msg_addr,
 }
 
 /* Posts a send request containing a crdss command with size MAX_MSG_LEN.   */
-int post_msg_sr(struct ib_ctx *ibctx, unsigned char *msg_addr) {
+int post_msg_sr(struct ib_ctx *ibctx, unsigned char *msg_addr, uint32_t imm) {
     int ret;
     struct ibv_send_wr swr;                 /* send work request            */
     struct ibv_sge sge;                     /* scatter/gather entry for wr  */
@@ -424,7 +435,8 @@ int post_msg_sr(struct ib_ctx *ibctx, unsigned char *msg_addr) {
     swr.next       = NULL;                  /* only send one msg at a time  */
     swr.sg_list    = &sge;
     swr.num_sge    = 1;
-    swr.opcode     = IBV_WR_SEND;
+    swr.opcode     = IBV_WR_SEND_WITH_IMM;
+    swr.imm_data   = htonl(imm);
     /* since crdss commands are rather small (<64B) we use inline sending   *
      * which provides better latency and simplifies send buffer handling    *
      * since message buffers can be reused immediately after post_recv ret. */
@@ -442,7 +454,7 @@ int post_msg_sr(struct ib_ctx *ibctx, unsigned char *msg_addr) {
 /* Initiates an RDMA transfer to the remote side of ibctx                   */
 int init_rdma_transfer(struct ib_ctx *ibctx, unsigned char *loc_addr,
                        unsigned char *rem_addr, size_t length, int use_imm,
-                       int signaled) {
+                       uint32_t imm, int signaled) {
     
     int ret;
     struct ibv_send_wr swr;                 /* send work request            */
@@ -468,9 +480,10 @@ int init_rdma_transfer(struct ib_ctx *ibctx, unsigned char *loc_addr,
     swr.wr.rdma.remote_addr = (uint64_t) rem_addr;
     swr.wr.rdma.rkey        = ibctx->remote_rkey;
 
+    /* TODO: check if this can be replaced with the remote client TID */
     if (use_imm != 0) {
         /* address window is limited to 4 GiB via this constraint           */
-        swr.imm_data = (uint32_t) ((uint64_t) loc_addr - ibctx->remote_addr);
+        swr.imm_data = imm;
     }
 
     ret = ibv_post_send(ibctx->qp, &swr, &bad);
@@ -562,7 +575,7 @@ int destroy_ibctx(struct ib_ctx *ibctx) {
 }
 
 /* Reads the next control message from an InfiniBand queue pair             */
-int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg) {
+int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
     struct ibv_cq *cq;
     void *compl_ctx;                        /* completion context (set to   *
                                              * NULL during init)            */
@@ -570,30 +583,30 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg) {
 
     if (ibv_get_cq_event(ibctx->cchannel, &cq, &compl_ctx) == -1) {
         logmsg(ERROR, "Failed to get next completion event notification.");
-        return(1);
+        return(-1);
     }
     
     /* actually, this should be always false, but check for completeness    */
     if (cq != ibctx->cq) {
         logmsg(ERROR, "CChannel delivered event from wrong CQ.");
-        return(1);
+        return(-1);
     }
 
     if (ibv_req_notify_cq(ibctx->cq, 0) == -1) {
         logmsg(ERROR, "Failed to rearm notification mechanism of CQ.");
-        return(1);
+        return(-1);
     }
 
     /* get the actual event from the CQ */
     if (ibv_poll_cq(ibctx->cq, 1, &cqe) < 1) {
         logmsg(ERROR, "Could not read completion event from CQ.");
-        return(1);
+        return(-1);
     }
 
     logmsg(DEBUG, "CQE status is: %u.", cqe.status);
     if (cqe.status != IBV_WC_SUCCESS) {
         logmsg(WARN, "CQE provided error code %u.", cqe.status);
-        return(1);
+        return((int) cqe.status);
     }
 
     if (cqe.opcode == IBV_WC_RDMA_WRITE) {
@@ -601,7 +614,7 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg) {
         unsigned char *new_msg = malloc(sizeof(uint64_t) + sizeof(uint8_t));
         if (new_msg == NULL) {
             logmsg(ERROR, "Could not allocate memory for completion message");
-            return(1);
+            return(-1);
         }
 
         memcpy(new_msg, &opcode, sizeof(uint8_t));
@@ -612,87 +625,13 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg) {
         *msg = (unsigned char *) cqe.wr_id; /* cast ID back to buffer ptr   */
     }
 
+    /* if an immediate value was sent, hand it to the receiver */
+    if (cqe.wc_flags & IBV_WC_WITH_IMM) {
+        *imm = ntohl(cqe.imm_data);
+    }
+
     /* acknowledge the event read */
     ibv_ack_cq_events(ibctx->cq, 1);
 
     return(0);
 }
-
-#ifdef bla
-/* Waits for the next message whose work request id is wrid.                */
-int wait_for_msg_id(struct ibctx *ibctx, uint64_t wrid) {
-    int next_err_cpy;
-
-    /* structs for IB completion routines */
-    struct ibv_cq *cq;
-    void          *compl_ctx;
-    struct ibv_wc *cqe;
-    
-    while (1) {
-        pthread_mutex_lock(&ibctx->mtx);
-
-        if (ibctx->next_id == wrid) {
-            next_err_cpy = ibctx->next_err;
-            pthread_mutex_unlock(&ibctx->mtx);
-            return(next_err_cpy);
-        }
-
-        if (ibctx->is_armed == 0) {
-            ibctx->is_armed = 1;
-
-            if (ibv_get_cq_event(ibctx->cchannel, &cq, &compl_ctx) == -1) {
-                logmsg(ERROR, "Failed to get completion event notification.");
-                ibctx->is_armed = 0;
-                ibv_req_notify_cq(ibctx->cq, 0);
-                pthread_cond_broadcast(&ibctx->cv);
-                pthread_mutex_unlock(&ibctx->mtx);
-                return(1);
-            }
-    
-            if (ibv_req_notify_cq(ibctx->cq, 0) == -1) {
-                logmsg(ERROR, "Failed to rearm notification mechanism of CQ.");
-                ibctx->is_armed = 0;
-                pthread_cond_broadcast(&ibctx->cv);
-                pthread_mutex_unlock(&ibctx->mtx);
-                return(1);
-            }
-
-            /* get the actual event from the CQ */
-            if (ibv_poll_cq(ibctx->cq, 1, &cqe) < 1) {
-                logmsg(ERROR, "Could not read completion event from CQ.");
-                ibctx->is_armed = 0;
-                ibv_req_notify_cq(ibctx->cq, 0);
-                pthread_cond_broadcast(&ibctx->cv);
-                pthread_mutex_unlock(&ibctx->mtx);
-                return(1);
-            }
-
-            logmsg(DEBUG, "CQE status is: %u.", cqe.status);
-            if (cqe.status != IBV_WC_SUCCESS) {
-                logmsg(WARN, "CQE provided error code %u.", cqe.status);
-                ibctx->next_err = 1;
-            }
-            else {
-                ibctx->next_err = 0;
-            }
-
-            ibctx->next_id = cqe.wr_id;
-
-            /* acknowledge the event read */
-            ibv_ack_cq_events(ibctx->cq, 1);
-            ibctx->is_armed = 0;
-
-            if (ibctx->next_if == wrid) {
-                break;
-
-        }
-        else {
-            pthread_cond_wait(&ibctx->cv);
-        }
-
-        pthread_mutex_unlock(&ibctx->mtx);
-    }
-
-    return(next_err_cpy);
-}
-#endif

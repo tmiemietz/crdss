@@ -54,6 +54,10 @@
 #define MTYPE_WRITE     0x23
 #define MTYPE_FASTWRITE 0x24                /* write with polling at client */
 
+/* messages for server management */
+#define MTYPE_CPOLL     0x50                /* use polling completion       */
+#define MTYPE_CBLOCK    0x51                /* use blocking completion      */
+
 /***                           client types                               ***/
 #define CLT_CAPMGR 0x01
 #define CLT_NORMAL 0x02

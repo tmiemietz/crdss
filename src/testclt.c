@@ -69,10 +69,6 @@ int main(int argc, char **argv) {
     struct ib_ctx ibctx;
     struct crdss_srv_ctx *sctx;
 
-    unsigned char *msg_buf = NULL;
-    unsigned char *rdma_buf = NULL;
-    int srv_fd = -1;
-
     uint64_t guid = (uint64_t) strtoull(CLT_GUID, NULL, 0);
 
     (void) argc;
@@ -124,23 +120,22 @@ int main(int argc, char **argv) {
 
     printf("Connecting to storage server (port %u)...\n", 
            ntohs(sctx->srv_addr.sin_port));
-    if ((srv_fd = connect_storage_srv(sctx)) != 0) {
+    if (connect_storage_srv(sctx) != 0) {
         printf("Unable to connect to storage server.\n");
         return(1);
     }
     printf("Done.\n");
 
     printf("Registering cap...\n");         /* use TCP */
-    if (reg_cap(srv_fd, NULL, cap.id) != 0) {
+    if (reg_cap(sctx, cap.id) != 0) {
         printf("Failed to register cap.\n");
-        close_srv_conn(srv_fd, &ibctx);
+        close_srv_conn(sctx);
         return(1);
     }
     printf("Done.\n");
     
     printf("Switching to InfiniBand communication...\n");
-    if (init_ib_comm(srv_fd, &ibctx, guid, &msg_buf, &rdma_buf, 
-        BUFFER_SIZE) != 0) {
+    if (init_ib_comm(sctx) != 0) {
         printf("IB setup failed.\n");
         return(1);
     }
@@ -150,7 +145,7 @@ int main(int argc, char **argv) {
            "%#x.\n", ibctx.remote_addr, ibctx.remote_rkey);
 
     printf("Closing connection to server...\n");
-    if (close_srv_conn(srv_fd, &ibctx) != 0) {
+    if (close_srv_conn(sctx) != 0) {
         printf("Error while closing server connection.\n");
         return(1);
     }

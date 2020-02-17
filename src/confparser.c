@@ -1045,7 +1045,7 @@ err:
 
 /* Checks the sanity of a configuration object for libcrdss.                */
 int check_libcfg(struct clt_lib_cfg *cfg) {
-    if (cfg->no_workers == 0) {
+    if (cfg->no_workers == 0 || cfg->no_workers > (UINT16_MAX - 1)) {
         fprintf(stderr, "Invalid value for worker count.\n");
         return(1);
     }

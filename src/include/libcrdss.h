@@ -47,11 +47,26 @@ struct crdss_srv_ctx {
     int tcp_fd;                     /* fd for TCP socket to server          */
     pthread_mutex_t tcp_lck;        /* lock for using the TCP connection    */
 
+    unsigned char *msg_buf;         /* pointer to message buffer (send/recv)*/
+    unsigned char *rdma_buf;        /* pointer to RDMA buffer               */
+    uint64_t guid;                  /* GUID of IB port used                 */
     struct ib_ctx ibctx;            /* InfiniBand context                   */
 
     struct clt_lib_cfg buf_cfg;     /* config for InfiniBand buffers        */
 
     pthread_key_t tls_key;          /* TLS ID for workers at this ctx       */
+
+    unsigned char *worker_ids;      /* bitmap to track used worker IDs      */
+    pthread_mutex_t id_lck;         /* lock for the worker ID bitmap        */
+
+    struct slist *avail_lbuf;       /* list of free large buffers           */
+    pthread_mutex_t lbuf_lck;       /* mutex and cv to wait for free lbufs  */
+    pthread_cond_t  lbuf_cv;
+
+    pthread_t compl_worker;         /* pointer to completion worker thread  */
+    struct slist *wait_workers;     /* list of workers that wait for a CQE  */
+    struct slist *unknown_compl;    /* completion for unknown workers       */
+    pthread_mutex_t wait_lck;       /* lock for waiter list                 */
 };
 
 /****************************************************************************
@@ -133,101 +148,187 @@ int request_new_cap(struct crdss_clt_cap *cap);
 /****************************************************************************
  *
  * Initializes an InfiniBand connection with the CRDSS storage server that
- * can be reached via the socket srv sock. The user of this function shall
- * allocate an InfiniBand context structure and pass this structure to 
- * this routine. Upon successful completion, the context contains various
- * IB-related structures. Data and message buffers are allocated by this 
- * function and returned via the respective pointers. After calling this
- * function, the queue pair in ibctx shall be ready for communication. 
+ * can be reached via the socket sctx->tcp_fd. Upon successful completion, 
+ * the server context contains a functional InfiniBand connection to the 
+ * server that backs sctx. Data and message buffers are allocated by this 
+ * function and stored in the respective fields of the server context struct. 
+ * They buffer size is determined by the IB buffer layout that was specified
+ * during the creation of the server context.
  * Connection data like the server's rkey are stored in the ib_ctx structure
- * provided to this function.
+ * inside the server context.
  *
- * Params: srvfd   - socket for TCP communication with server.
- *         ibctx   - preallocated InfiniBand context.
- *         guid    - identifier of port to use for IB communication.
- *         msgbuf  - message buffer is stored in this ptr (output param).
- *         rdmabuf - RDMA buffer is stored in this ptr (output param).
- *         rdmasz  - size of RDMA buffer to allocate.
+ * Params: sctx - context of server with that an IB connection shall will be
+ *                established.
  *
  * Returns: 0 on success, 1 on error.
  */
-int init_ib_comm(int srvfd, struct ib_ctx *ibctx, uint64_t guid,
-                 unsigned char **msgbuf, unsigned char **rdmabuf, int rdmasz);
+int init_ib_comm(struct crdss_srv_ctx *sctx);
 
 /****************************************************************************
  *
- * Closes a connection to a CRDSS storage server. The user shall pass both
- * the fd for the TCP socket to the server as well as the IB context if it
- * has been created already. However, the user is still responsible for
- * freeing the data and message buffers of the IB context as well as the
- * context object itself. Note that it is valid to pass NULL for the IB ctx
- * if no queue pair setup has been done yet.
+ * Closes a connection to a CRDSS storage server. This will lead to a
+ * teardown of both the TCP connection to the server and (if present) the
+ * IB queue pairs associated with this context. All InfiniBand buffers that
+ * were used by sctx are freed by this routine. In a multi-threaded program,
+ * the user is responsible for coordinating his threads so that the 
+ * teardown of the connection does not lead to deadlocks etc.
  *
- * Params: srvfd - fd for TCP socket to server.
- *         ibctx - IB context as yielded from the init_ib_comm rountine.
+ * Note: The function will also free sctx, so after calling this function,
+ *       sctx is no longer a valid pointer.
+ *
+ * Params: sctx - context of connection to be closed.
  *
  * Returns: 0 on success, 1 on error.
  */
-int close_srv_conn(int srvfd, struct ib_ctx *ibctx);
+int close_srv_conn(struct crdss_srv_ctx *sctx);
 
 /****************************************************************************
  *
- * Registers a capability at the server by specifying the cap ID. If the
- * IB context passed to this function is NULL, the TCP socket with fd srvfd
- * will be used, otherwise communication is done via SEND/RECEIVE ops.
+ * Registers a capability at the server identified by sctx. In order to
+ * execute this function, the server context must have been connected to
+ * a server. If the IB connection to the server is not active yet, the
+ * registration request is sent via TCP.
  * Note that the capability ID passed to this function must contain CAP_ID_LEN
  * characters, otherwise the behavior of this function is undefined.
  *
- * Params: srvfd - fd for TCP socket to server.
- *         ibctx - IB context as yielded from the init_ib_comm routine.
+ * Params: sctx  - server connection context.
  *         capid - pointer to buffer for capability ID.
  *
  * Returns: 0 on success, 1 on error.
  */
-int reg_cap(int srvfd, struct ib_ctx *ibctx, unsigned char *capid);
+int reg_cap(struct crdss_srv_ctx *sctx, unsigned char *capid);
+
+/****************************************************************************
+ *
+ * Deletes a revocation domain at the server identified by sctx. In order to
+ * execute this function, the server context must have been conencted to a 
+ * server. If the IB connection is not active, yet, the deletion request
+ * will be sent via TCP. In order for the request to succeed, the client 
+ * must have registered at least one capability with the server that belongs
+ * to the deleted revocation domain.
+ *
+ * Params: sctx - server connection context.
+ *         rdom - ID of revocation domain to delete.
+ *
+ * Returns: 0 on success, 1 on error.
+ */
+int delete_rdom(struct crdss_srv_ctx *sctx, uint32_t rdom);
+
+/****************************************************************************
+ *
+ * Queries the server identified by sctx to switch to polling completion.
+ * When using polling completion on the server side, the latency of requests
+ * is improved. This however comes at a much higher CPU utilization. The 
+ * function will only work if the server context has an active InfiniBand
+ * connection.
+ *
+ * Params: sctx - server connection context.
+ * 
+ * Returns: 0 on success, 1 on error.
+ */
+int query_srv_poll(struct crdss_srv_ctx *sctx);
+
+/****************************************************************************
+ * 
+ * Queries the server identified by sctx to switch to blocking completion.
+ * When using blocking completion on the server side, the latency of requests
+ * is increased. However, blocking completion significantly lowers the CPU
+ * utilization on the server side. The function will only work if the server
+ * context has an active InfiniBand connection.
+ *
+ * Params: sctx - server connection context.
+ *
+ * Returns: 0 on success, 1 on error.
+ */
+int query_srv_block(struct crdss_srv_ctx *sctx);
 
 /****************************************************************************
  *
  * Reads len bytes from the storage location specified by didx, sidx and
- * saddr and stores them at rdma_addr in the RDMA buffer allocated for
- * the queue pair when the InfiniBand connection has been set up. This function
- * will enter a polling loop until the completion notification has been put
- * at address poll_field by the server.
+ * saddr and stores them in the buffer pointed to by buf. This function uses
+ * polling-based I/O completion with a doorbell memory address. For best
+ * latency, the server shall be switched to polling completion as well before
+ * calling this function. The function will fail if the calling thread can not
+ * be registered with a dorbell / sbuf entry.
  *
  * Params: ibctx      - IB context as yielded from the init_ib_comm routine.
  *         didx       - index of device to read from.
  *         sidx       - index of vslice to read from.
  *         saddr      - address inside vslice to read from.
+ *         buf        - buffer provided by user for storing the data.
  *         len        - number of bytes to read.
- *         rdma_addr  - location where data shall be written to.
- *         poll_field - memory address used as a status indicator.
  *
  * Returns: The status of the operation, as defined in include/protocol.h.
  */
-int fast_read_raw(struct ib_ctx *ibctx, uint16_t didx, uint32_t sidx,
-                  uint64_t saddr, uint32_t len, uint64_t rdma_addr, 
-                  uint64_t poll_field);
+int fast_read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
+                  uint64_t saddr, void *buf, uint32_t len);
 
 /****************************************************************************
  *
  * Writes len bytes to the storage location specified by didx, sidx and
- * saddr. Data is written from the buffer located at rdma_addr in the RDMA 
- * region allocated for the queue pair when the InfiniBand connection has been 
- * set up. This function will enter a polling loop until the completion 
- * notification has been put at address poll_field by the server.
+ * saddr. Data is taken from the user-provided buffer pointed to by buf.
+ * This function uses polling completion in combination with a doorbell 
+ * memory address. For lowest latency, the server shall be switched to polling 
+ * compltione as well before calling this function.
+ * The function will fail if the calling thread can not be registered with a 
+ * dorbell / sbuf entry.
  *
  * Params: ibctx      - IB context as yielded from the init_ib_comm routine.
  *         didx       - index of device to write to.
  *         sidx       - index of vslice to write to.
  *         saddr      - address inside vslice to write to.
+ *         buf        - buffer provided by user that contains the data to be
+ *                      written.
  *         len        - number of bytes to write.
- *         rdma_addr  - location where data shall be taken from.
- *         poll_field - memory address used as a status indicator.
  *
  * Returns: The status of the operation, as defined in include/protocol.h.
  */
-int fast_write_raw(struct ib_ctx *ibctx, uint16_t didx, uint32_t sidx,
-                   uint64_t saddr, uint32_t len, uint64_t rdma_addr, 
-                   uint64_t poll_field);
+int fast_write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
+                   uint64_t saddr, void *buf, uint32_t len);
+
+/****************************************************************************
+ *
+ * Reads len bytes from the storage location specified by didx, sidx and
+ * saddr and stores them in the buffer pointed to by buf. This function uses 
+ * InfiniBand's blocking completion mechanism. The RDMA buffer used for data
+ * transmission is allocated from the global list of large buffers. 
+ * Consequently, when there are more threads using this function than there
+ * are large buffers, the calling threads will have to wait for such a large
+ * buffer to become available.
+ *
+ * Params: ibctx      - IB context as yielded from the init_ib_comm routine.
+ *         didx       - index of device to read from.
+ *         sidx       - index of vslice to read from.
+ *         saddr      - address inside vslice to read from.
+ *         buf        - buffer provided by user for storing the data.
+ *         len        - number of bytes to read.
+ *
+ * Returns: The status of the operation, as defined in include/protocol.h.
+ */
+int read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,    
+             uint64_t saddr, void *buf, uint32_t len);
+
+/****************************************************************************
+ *
+ * Writes len bytes to the storage location specified by didx, sidx and
+ * saddr. Data is taken from the user-provided buffer pointed to by buf.
+ * This function uses InfiniBand's blocking completion mechanism. 
+ * The RDMA buffer used for data transmission is allocated from the global 
+ * list of large buffers. Consequently, when there are more threads using 
+ * this function than there are large buffers, the calling threads will have
+ * to wait for such a large buffer to become available.
+ *
+ * Params: ibctx      - IB context as yielded from the init_ib_comm routine.
+ *         didx       - index of device to write to.
+ *         sidx       - index of vslice to write to.
+ *         saddr      - address inside vslice to write to.
+ *         buf        - buffer provided by user that contains the data to be
+ *                      written.
+ *         len        - number of bytes to write.
+ *
+ * Returns: The status of the operation, as defined in include/protocol.h.
+ */
+int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
+              uint64_t saddr, void *buf, uint32_t len);
 
 #endif /* LIBCRDSS_H */

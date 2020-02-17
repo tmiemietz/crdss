@@ -62,6 +62,8 @@ struct handler {
     unsigned char *data_buf;                /* buffer for RDMA accesses     */
 
     struct ib_ctx *ibctx;                   /* wrapper for IB structures    */
+
+    pthread_t *ib_workers;                  /* pointers to IB worker threads*/
 };
 
 /* structure that holds information about a poll field for clt notification */
@@ -278,24 +280,25 @@ static int check_cap_bounds(uint16_t didx, uint32_t sidx, uint64_t saddr,
  */
 static int get_next_msg_type(struct handler *handler, unsigned char **msg,
         uint8_t *type) {
-   
-   if (handler->ibctx == NULL) {
+    uint32_t bla;   /* PRELIMINARY, REMOVE LATER !!! */
+
+    if (handler->ibctx == NULL) {
         /* read type from socket */
         if (recv(handler->sock, type, 1, MSG_WAITALL) < 1) {
             logmsg(ERROR, "Handler %lu: Connection terminated (status: %d).",
                    handler->tid, errno);
             return(1);
         }
-   }
-   else {
+    }
+    else {
         /* get next IB message */
-        if (get_next_ibmsg(handler->ibctx, msg) != 0)
+        if (get_next_ibmsg(handler->ibctx, msg, &bla) != 0)
             return(1);
 
         *type = **msg;
-   }
+    }
 
-   return(0);
+    return(0);
 }
 
 /***************************************************************************
@@ -1416,13 +1419,17 @@ static void handle_capmgr(struct handler *handler) {
     }
 }
 
-/***************************************************************************
+/****************************************************************************
  *
- * Handles requests of a normal client.
+ * Handles InfiniBand requests of a normal client.
  *
- * TODO: add documentation.
+ * Params: ctx - pionts to a handler structure.
+ *
+ * Returns: NULL
  */
-static void handle_normal_clt(struct handler *handler) {
+static void *ib_worker(void *ctx) {
+    struct handler *handler = (struct handler *) ctx;
+
     struct crdss_srv_cap *new_cap;          /* pointer to new capability    */
 
     uint8_t op_res;                         /* result of server operations  */
@@ -1432,7 +1439,6 @@ static void handle_normal_clt(struct handler *handler) {
     /* fields for reading data from network */
     unsigned char *msg;                     /* buffer for IB message        */
     uint8_t msg_type;
-
     uint16_t device_idx;
     uint32_t slice_idx;
     uint64_t saddr;                             /* start address of cap     */
@@ -1441,6 +1447,8 @@ static void handle_normal_clt(struct handler *handler) {
     uint32_t rdom_id;                           /* id of revocation domain  */
     uint32_t rdmasz;                            /* size of RDMA region as   *
                                                  * requested by the client  */
+    uint32_t msg_cnt;                           /* no. of msgs requested by *
+                                                 * the client               */
 
     uint16_t rlid;                              /* LID of peer              */
     uint32_t rqpn;                              /* QPN of peer              */
@@ -1484,6 +1492,11 @@ static void handle_normal_clt(struct handler *handler) {
                            handler->tid);
                     return;
                 }
+                if (recv(handler->sock, &msg_cnt, 4, MSG_WAITALL) < 4) {
+                    logmsg(ERROR, "Handler %lu: Failed to read message count.",
+                           handler->tid);
+                    return;
+                }
                 if (recv(handler->sock, &rdmasz, 4, MSG_WAITALL) < 4) {
                     logmsg(ERROR, "Handler %lu: Failed to read RDMA reg. size.",
                            handler->tid);
@@ -1520,9 +1533,11 @@ static void handle_normal_clt(struct handler *handler) {
                 /* set connection information to context */
                 handler->ibctx->rem_lid    = ntohs(rlid);
                 handler->ibctx->remote_qpn = ntohl(rqpn);
+                msg_cnt                    = ntohl(msg_cnt);
 
                 if (setup_srv_qp(handler->ibctx, server_conf.guid, 
-                        &handler->msg_buf, &handler->data_buf, rdmasz) != 0) {
+                                 &handler->msg_buf, msg_cnt,
+                                 &handler->data_buf, rdmasz) != 0) {
                     logmsg(ERROR, "Handler %lu: Failed to setup server QP.",
                            handler->tid);
                     op_res = R_FAILURE;
@@ -1993,6 +2008,320 @@ static void handle_normal_clt(struct handler *handler) {
                 return;
         }
     }
+
+    return(NULL);
+}
+
+/****************************************************************************
+ *
+ * Handles TCP requests of a normal client. This function is the "father"
+ * thread for any InfiniBand worker threads that are created during
+ * establishing an IB connection. IB creation and teardown requests can only
+ * be sent via TCP.
+ *
+ * Params: handler - context structure for client connection.
+ */
+static void handle_normal_clt(struct handler *handler) {
+    struct crdss_srv_cap *new_cap;          /* pointer to new capability    */
+
+    uint8_t op_res;                         /* result of server operations  */
+
+    unsigned char cap_buf[CAP_ID_LEN];      /* buffer for receiving cap ids */
+
+    /* fields for reading data from network */
+    unsigned char *msg;                     /* buffer for IB message        */
+    uint8_t msg_type;
+    uint16_t device_idx;
+    uint32_t slice_idx;
+    uint64_t saddr;                             /* start address of cap     */
+    uint64_t eaddr;                             /* end address of cap       */
+    uint16_t cap_rights;
+    uint32_t rdom_id;                           /* id of revocation domain  */
+    uint32_t rdmasz;                            /* size of RDMA region as   *
+                                                 * requested by the client  */
+    uint32_t msg_cnt;                           /* no. of msgs requested by *
+                                                 * the client               */
+
+    uint16_t rlid;                              /* LID of peer              */
+    uint32_t rqpn;                              /* QPN of peer              */
+    
+    uint64_t clt_rdma_addr;                     /* address of clt RDMA buf  */
+    uint32_t clt_rkey;                          /* rkey of clt RDMA buf     */
+
+    uint32_t length;                            /* length of data operation */
+    uint64_t rdma_offs;                         /* offset in RDMA buffer    */
+
+    struct slist *open_reqs = NULL;             /* open RDMA requests       */
+    struct slist *lptr;                         /* ptr for list iteration   */
+    struct clt_poll_field *pfield = NULL;       /* poll field structure     */
+
+    logmsg(DEBUG, "Handler %lu: Entering client handler.", handler->tid);
+    while (1) {
+        /* every message starts with the type field */
+        if (recv(handler->sock, &msg_type, sizeof(uint8_t), MSG_WAITALL) < 1) {
+            logmsg(ERROR, "Handler %lu: Connection terminated (status: %s).", 
+                   handler->tid, strerror(errno));
+            
+            /* XXX insert IB teardown function here XXX */
+            return;
+        }
+        
+        switch (msg_type) {
+            case MTYPE_IBINIT:
+                /* Initializes an InfiniBand connection, if connection is   *
+                 * successful, the server responds with the memory          *
+                 * credentials of the designated receive memory window      */
+                /* important: read data first to keep track of messages,    *
+                 * error handling can be done after reading data from sock  */
+                logmsg(DEBUG, "Handler %lu: Client requests InfiniBand "
+                       "connection.", handler->tid);
+
+                /* if no IB conn is active yet, read parameters from socket */
+                if (recv(handler->sock, &rlid, 2, MSG_WAITALL) < 2) {
+                    logmsg(ERROR, "Handler %lu: Failed to read remote LID.",
+                           handler->tid);
+                    return;
+                }
+                if (recv(handler->sock, &rqpn, 4, MSG_WAITALL) < 4) {
+                    logmsg(ERROR, "Handler %lu: Failed to read remote QPN.",
+                           handler->tid);
+                    return;
+                }
+                if (recv(handler->sock, &msg_cnt, 4, MSG_WAITALL) < 4) {
+                    logmsg(ERROR, "Handler %lu: Failed to read message count.",
+                           handler->tid);
+                    return;
+                }
+                if (recv(handler->sock, &rdmasz, 4, MSG_WAITALL) < 4) {
+                    logmsg(ERROR, "Handler %lu: Failed to read RDMA reg. size.",
+                           handler->tid);
+                    return;
+                }
+
+                /* do nothing if this client already has an IB connection  */
+                if (handler->ibctx != NULL) {
+                    logmsg(WARN, "Handler %lu: Client requested IB connection "
+                           "twice.", handler->tid);
+                    op_res = R_FAILURE;
+                    send(handler->sock, &op_res, 1, 0);
+                    continue;
+                }
+
+                /* client should have at least one capabilitiy registered  */
+                if (slist_empty(handler->caps)) {
+                    logmsg(WARN, "Handler %lu: Client requested IB connection "
+                           "without specifying capabilities.", handler->tid);
+                    op_res = R_FAILURE;
+                    send(handler->sock, &op_res, 1, 0);
+                    continue;
+                }
+
+                /* allocate context and setup data structures */
+                if ((handler->ibctx = malloc(sizeof(struct ib_ctx))) == NULL) {
+                    logmsg(ERROR, "Handler %lu: Failed to allocate IB ctx.",
+                           handler->tid);
+                    op_res = R_FAILURE;
+                    send(handler->sock, &op_res, 1, 0);
+                    continue;
+                }
+
+                /* set connection information to context */
+                handler->ibctx->rem_lid    = ntohs(rlid);
+                handler->ibctx->remote_qpn = ntohl(rqpn);
+                msg_cnt                    = ntohl(msg_cnt);
+
+                if (setup_srv_qp(handler->ibctx, server_conf.guid, 
+                                 &handler->msg_buf, msg_cnt,
+                                 &handler->data_buf, rdmasz) != 0) {
+                    logmsg(ERROR, "Handler %lu: Failed to setup server QP.",
+                           handler->tid);
+                    op_res = R_FAILURE;
+                    send(handler->sock, &op_res, 1, 0);
+                   
+                    /* tear down IB context on error */
+                    destroy_ibctx(handler->ibctx);
+                    free(handler->ibctx);
+                    if (handler->msg_buf != NULL)  free(handler->msg_buf);
+                    if (handler->data_buf != NULL) free(handler->data_buf);
+                    
+                    continue;
+                }
+
+                logmsg(DEBUG, "Handler %lu: Setup IB queue pair for client, "
+                       "RDMA region size is %u.", handler->tid, rdmasz); 
+
+                /* success, send answer to client */
+                op_res = R_SUCCESS;
+                /* reuse rlid and rqpn for answer to client */
+                rlid = htons(handler->ibctx->loc_lid);
+                rqpn = htonl(handler->ibctx->qp->qp_num);
+                send(handler->sock, &op_res, 1, 0);
+                send(handler->sock, &rlid, 2, 0);
+                send(handler->sock, &rqpn, 4, 0);
+
+                /* reuse address variables for transmission of mem conf.    */
+                saddr = (uint64_t) handler->data_buf;   /* buf start addr   */
+                rqpn  = handler->ibctx->rdma_mr->rkey;  /* now rkey         */
+                saddr = htobe64(saddr);
+                rqpn  = htonl(rqpn);
+                send(handler->sock, &saddr, 8, 0);
+                send(handler->sock, &rqpn, 4, 0);
+
+                /* receive memory window information of the client          */
+                if (recv(handler->sock, &clt_rdma_addr, 8, MSG_WAITALL) < 8 ||
+                    recv(handler->sock, &clt_rkey, 4, MSG_WAITALL) < 4) {
+                    logmsg(ERROR, "Handler %lu: Failed to read client answer "
+                           "for exchange of RDMA keys.", handler->tid);
+                    return;
+                }
+                handler->ibctx->remote_addr = be64toh(clt_rdma_addr);
+                handler->ibctx->remote_rkey = ntohl(clt_rkey);
+
+                break;
+            case MTYPE_REGCAP:
+                /* register cap with this handler thread                    */
+                logmsg(DEBUG, "Handler %lu: Handling REGCAP request.", 
+                       handler->tid);
+                    
+                /* read cap ID over TCP */
+                if (recv(handler->sock, cap_buf, CAP_ID_LEN, 
+                         MSG_WAITALL) < CAP_ID_LEN) {
+                    logmsg(ERROR, "Handler %lu: Failed to read cap id.",
+                           handler->tid);
+                    return;
+                }
+
+                op_res = handle_regcap(handler, cap_buf);
+
+                if (op_res == R_SUCCESS) {
+                    logmsg(INFO, "Handler %lu: Registered new cap.", 
+                           handler->tid);
+                }
+                else {
+                    logmsg(INFO, "Handler %lu: Cap registration failed (%u).",
+                           handler->tid, op_res);
+                }
+
+                /* finally send a status answer to the client */
+                send(handler->sock, &op_res, 1, 0);
+
+                break;
+            case MTYPE_DRVCAP:
+                /* derive a cap from one of the caps that are already       *
+                 * registered with this thread. the new cap will have the   *
+                 * same revocation domain as its parent                     */
+                if (recv(handler->sock, cap_buf, CAP_ID_LEN, 
+                         MSG_WAITALL) < CAP_ID_LEN) {
+                    logmsg(ERROR, "Handler %lu: Failed to read parent cap "
+                           "id.", handler->tid);
+                    return;
+                }
+
+                if (read_cap_from_sock(handler->sock, &device_idx, 
+                        &slice_idx, &saddr, &eaddr, &cap_rights) != 0) {
+                    logmsg(ERROR, "Handler %lu: Failed to read capability "
+                           "as requested.", handler->tid);
+                    return;
+                }
+
+                op_res = handle_drvcap(handler, cap_buf, device_idx, slice_idx,
+                                saddr, eaddr, cap_rights, &new_cap);
+                
+                if (op_res != R_SUCCESS) {
+                    logmsg(ERROR, "Handler %lu: Cap derivation failed (%u).",
+                           handler->tid, op_res);
+                    send(handler->sock, &op_res, 1, 0);
+                    
+                    continue;
+                }
+                else {
+                    logmsg(DEBUG, "Handler %lu: derived new cap %p.", 
+                           handler->tid, new_cap);
+
+                    /* lastly, send the cap id to the capmgr */
+                    send(handler->sock, &op_res, sizeof(uint8_t), 0);
+                    send(handler->sock, &new_cap->id, CAP_ID_LEN, 0);
+                }
+
+                break;
+            case MTYPE_DRVCAP2:
+                /* derive a cap from one of the caps that are already       *
+                 * registered with this thread. a new revocation domain     *
+                 * will be created with the new cap being the first member. *
+                 * this new revocation domain will be a descendant of the   *
+                 * rdom the parent cap was assigned to.                     */
+                logmsg(DEBUG, "Handler %lu: Processing DRVCAP2 request.",
+                       handler->tid);
+                if (recv(handler->sock, cap_buf, CAP_ID_LEN, 
+                         MSG_WAITALL) < CAP_ID_LEN) {
+                    logmsg(ERROR, "Handler %lu: Failed to read parent cap "
+                           "id.", handler->tid);
+                    return;
+                }
+
+                if (read_cap_from_sock(handler->sock, &device_idx, 
+                        &slice_idx, &saddr, &eaddr, &cap_rights) != 0) {
+                    logmsg(ERROR, "Handler %lu: Failed to read capability "
+                           "as requested.", handler->tid);
+                    return;
+                }
+
+                op_res = handle_drvcap(handler, cap_buf, device_idx, slice_idx,
+                                saddr, eaddr, cap_rights, &new_cap);
+
+                if (op_res != R_SUCCESS) {
+                    logmsg(ERROR, "Handler %lu: Cap derivation failed (%u).",
+                           handler->tid, op_res);
+                    send(handler->sock, &op_res, 1, 0);
+                    
+                    continue;
+                }
+                else {
+                    logmsg(DEBUG, "Handler %lu: registered new cap %p.", 
+                           handler->tid, new_cap);
+
+                    /* lastly, send the id of the new cap to the capmgr    */
+                    rdom_id = htonl(new_cap->rev_dom->dom_key);
+                    send(handler->sock, &op_res, sizeof(uint8_t), 0);
+                    send(handler->sock, &new_cap->id, CAP_ID_LEN, 0);
+                    send(handler->sock, &rdom_id, sizeof(uint32_t), 0);
+                }
+
+                logmsg(DEBUG, "Handler %lu: transferred new cap %p.",
+                       handler->tid, new_cap);
+                break;
+            case MTYPE_RMDOM:
+                /* removes all caps of a certain rev dom from the global cap*
+                 * list, destroys the rdoms and renders handler's local     *
+                 * copies of caps invalid                                   */
+                if (recv(handler->sock, &rdom_id,  sizeof(uint32_t), 
+                    MSG_WAITALL) < 2) {
+                    logmsg(ERROR, "Failed to read rdom id as requested.");
+                    return;
+                }
+                
+                op_res = handle_rmdom(handler, rdom_id);
+                if (op_res != R_SUCCESS) {
+                    logmsg(WARN, "Handler %lu: Failed to revoke domain %u.",
+                           handler->tid, rdom_id);
+                }
+
+                send(handler->sock, &op_res, sizeof(uint8_t), 0);
+                
+                break;
+            case MTYPE_BYE:
+                logmsg(INFO, "Handler %lu: Client requested shutdown.",
+                       handler->tid);
+
+                /* XXX insert IB teardown function here XXX */
+
+                return;
+            default:
+                logmsg(WARN, "Handler %lu: Received unknown message type %u.",
+                       handler->tid, msg_type);
+                return;
+        }
+    }
 }
 
 /****************************************************************************
@@ -2204,7 +2533,7 @@ static void *entry_listener(void *args) {
                ntohs(clt_addr.sin_port));
 
         /* allocate handler struct and fill necessary fields                */
-        new_handler = malloc(sizeof(struct handler));
+        new_handler = calloc(1, sizeof(struct handler));
         if (new_handler == NULL) {
             logmsg(ERROR, "Failed to allocate memory for new client handler.");
             continue;

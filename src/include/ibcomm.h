@@ -28,11 +28,6 @@
  ****************************************************************************/
 
 
-/* size of the control message buffer. The size weill be allocated for both *
- * send and receive buffers. I.e, a value of 10 means that memory for 10    *
- * send requests as well as for 10 receive requests is allocated            */
-#define RBUF_MSG_CNT 10
-
 /* max. number of scatter-gather elements per request, to be tuned          */
 #define MAX_SGE 10
 
@@ -40,6 +35,10 @@
 #define MAX_SRV_BUF_SZ  1073741824      /* max amount of mem that each clt  *
                                          * may claim on server side for RDMA*
                                          * hard limit is currently 1 GiB    */
+
+#define MAX_SRV_MSG_QD  2048            /* max. no of messages that are     *
+                                         * supported for a single msg buffer*
+                                         * i.e., for a single connection    */
 
 /* preliminary, hardcoded values to indicate which pkey to use, change later*/
 #define CRDSS_PKEY_IDX 0
@@ -63,6 +62,9 @@ struct ib_ctx {
 
     struct ibv_comp_channel *cchannel;      /* for non-polling completion   */
 
+    uint32_t msg_cnt;                       /* no. of receive requests with *
+                                             * a size of MAX_MSG_LEN that   *
+                                             * fit in the message buffer    */
     struct ibv_mr *msg_mr;                  /* mem region for messages      */
     struct ibv_mr *rdma_mr;                 /* mem region for data transfer */
 
@@ -76,14 +78,6 @@ struct ib_ctx {
     uint64_t remote_addr;                   /* start address of remote RDMA *
                                              * buffer for data transfer     */
     uint32_t remote_rkey;                   /* rkey of remote data buffer   */
-
-    /* client-side fields for coordination of blocking completion           */
-    pthread_mutex_t mtx;
-    pthread_cond_t  cv;
-
-    int      is_armed;
-    int      next_err;
-    uint64_t next_id;
 };
 
 /****************************************************************************
@@ -105,13 +99,15 @@ struct ib_ctx {
  *         guid    - InfiniBand GUID of the port used for communication.
  *         msgbuf  - pointer to the location of the control message buffer
  *                   (output parameter).
+ *         msg_cnt - queue depth for CRDSS control messages transmitted using
+ *                   SEND/RECV verbs.
  *         rdmabuf - pointer to the RDMA buffer region (output parameter).
  *         rdmasz  - size of RDMA buffer to allocate.
  *
  * Returns: 0 on success, 1 on error.
  */
 int init_clt_qp(struct ib_ctx *ibctx, uint64_t guid, unsigned char **msgbuf, 
-                unsigned char **rdmabuf, int rdmasz);
+                uint32_t msg_cnt, unsigned char **rdmabuf, uint32_t rdmasz);
 
 /****************************************************************************
  *
@@ -145,13 +141,15 @@ int complete_clt_qp(struct ib_ctx *ibctx, unsigned char *msg_buf);
  * Params: ibctx   - mantle structure for IB context.
  *         guid    - InfiniBand GUID of the port used for communication.
  *         msgbuf  - pointer to control message buffer (output parameter).
+ *         msg_cnt - queue depth for CRDSS control messages transmitted using
+ *                   SEND/RECV verbs.
  *         databuf - pointer to buffer for sending and RDMA (output parameter).
  *         rdmasz  - size of the server's RDMA region for data transfer.
  *
  * Returns: 0 on success, 1 on any error.
  */
 int setup_srv_qp(struct ib_ctx *ibctx, uint64_t guid, unsigned char **msgbuf, 
-                 unsigned char **databuf, uint32_t rdmasz);
+                 uint32_t msg_cnt, unsigned char **databuf, uint32_t rdmasz);
 
 /****************************************************************************
  *
@@ -180,10 +178,11 @@ int post_msg_rr(struct ib_ctx *ibctx, unsigned char *msg_addr,
  *
  * Params: ibctx    - mantle structure for IB context.
  *         msg_addr - start address of message buffer.
+ *         imm      - an immediate value that is sent along with the buffer.
  *
  * Returns: 0 on success, 1 on error.
  */
-int post_msg_sr(struct ib_ctx *ibctx, unsigned char *msg_addr);
+int post_msg_sr(struct ib_ctx *ibctx, unsigned char *msg_addr, uint32_t imm);
 
 /****************************************************************************
  *
@@ -199,6 +198,7 @@ int post_msg_sr(struct ib_ctx *ibctx, unsigned char *msg_addr);
  *         length   - amount of data to transmit.
  *         use_imm  - if != 0 use an RDMA with immediate operation to tell
  *                    the remote side about this operation.
+ *         imm      - immediate value to send. ignored if use_imm == 0
  *         signaled - if != 0, a completion event for the RDMA op will be
  *                    generated in the sender's CQ.
  *
@@ -206,7 +206,7 @@ int post_msg_sr(struct ib_ctx *ibctx, unsigned char *msg_addr);
  */
 int init_rdma_transfer(struct ib_ctx *ibctx, unsigned char *loc_addr, 
                        unsigned char *rem_addr, size_t length, int use_imm,
-                       int signaled);
+                       uint32_t imm, int signaled);
 
 /****************************************************************************
  *
@@ -244,27 +244,16 @@ int destroy_ibctx(struct ib_ctx *ibctx);
  * To save CPU resources, a blocking completion notification via a completion
  * channel is used. Currently, this channel acknowledges one message at a
  * time in each call to this function, which might be a performance pitfall.
+ * If the message received comes with an immediate value, it is stored in 
+ * the location referenced by imm.
  *
  * Params: ibctx - InfiniBand context of the calling handler thread.
  *         msg   - points to a pointer where the message start shall be saved.
+ *         imm   - immediate value received with last message.
  *
- * Returns: 0 on success, 1 on error.
+ * Returns: 0 on success, -1 on internal error (e.g. failing to rearm the CC), 
+ *          a positive number if the completion request contained an error.
  */
-int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg);
-
-#ifdef bla
-/****************************************************************************
- *
- * Waits for the next message whise work request id is wrid. This is a 
- * blocking operation and requires coordination between all threads that
- * are currently waiting on this queue pair.
- *
- * Params: ibctx - InfiniBand context of the calling thread.
- *         wrid  - work request ID to wait for.
- *
- * Returns: 0 on success, 1 on error.
- */
-int wait_for_msg_id(struct ibctx *ibctx, uint64_t wrid);
-#endif
+int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm);
 
 #endif /* IBCOMM_H */
