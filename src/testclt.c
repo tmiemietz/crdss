@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
     inet_pton(AF_INET, DEFAULT_SRV, &cap.srv.sin_addr);
     cap.dev_idx    = 0;
     cap.vslc_idx   = 0;
-    cap.start_addr = 2;
+    cap.start_addr = 0;
     cap.end_addr   = 2047;
     cap.rights     = CAP_READ | CAP_WRITE;
     cap.key        = NULL;
@@ -158,18 +158,18 @@ int main(int argc, char **argv) {
     printf("Trying read (didx = %u, sidx = %u, saddr = %lu, eaddr = %lu).\n",
            cap.dev_idx, cap.vslc_idx, cap.start_addr, buf_len - 1);
 
-    if (read_raw(sctx, cap.dev_idx, cap.vslc_idx, 0, iobuf, buf_len - 1) != 0) 
+    if (read_raw(sctx, cap.dev_idx, cap.vslc_idx, 0, iobuf, buf_len) != 0) 
     {
         printf("Failed to read from remote device...\n");
         return(1);
     }
-    printf("Buffer content after initial read: %s\n", iobuf);
+    printf("Buffer content after initial read: \"%s\"\n", iobuf);
 
     printf("Rewriting buffer...\n");
     memset(iobuf, 0, buf_len);
     memcpy(iobuf, "Yeet and greet O_o", strlen("Yeet and greet O_o"));
         
-    if (write_raw(sctx, cap.dev_idx, cap.vslc_idx, 0, iobuf, buf_len - 1) 
+    if (write_raw(sctx, cap.dev_idx, cap.vslc_idx, 0, iobuf, buf_len) 
         != 0) {
         printf("Failed to write to remote device...\n");
         return(1);
@@ -177,17 +177,28 @@ int main(int argc, char **argv) {
     printf("Done.\n");
 
     printf("Re-reading buffer contents (fast path).\n");
-    if (query_srv_block(sctx) != 0) {
+    if (query_srv_poll(sctx) != 0) {
         printf("Failed to switch server to polling mode.\n");
         return(1);
     }
+    printf("Switched server to polling mode.\n");
 
-    if (fast_read_raw(sctx, cap.dev_idx, cap.vslc_idx, 0, iobuf, 
-        buf_len - 1) != 0) {
+    if (fast_read_raw(sctx, cap.dev_idx, cap.vslc_idx, 0, iobuf, buf_len) != 0){
         printf("Failed to re-read buffer (fast path)...\n");
         return(1);
     }
     printf("Buffer content after second reading: %s\n", iobuf);
+
+    printf("Rewriting buffer a second time (fast path)...\n");
+    memset(iobuf, 0, buf_len);
+    memcpy(iobuf, "Sample Data 123...", buf_len - 1);
+        
+    if (fast_write_raw(sctx, cap.dev_idx, cap.vslc_idx, 0, iobuf, buf_len) 
+        != 0) {
+        printf("Failed to write to remote device...\n");
+        return(1);
+    }
+    printf("Done.\n");
 
     printf("Closing connection to server...\n");
     if (close_srv_conn(sctx) != 0) {

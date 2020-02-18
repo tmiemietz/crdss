@@ -21,6 +21,7 @@
 #include <infiniband/verbs.h>               /* IB communication definitions */
 #include <errno.h>                          /* find out reasons for errors  */
 #include <arpa/inet.h>                      /* byte order conversion        */
+#include <time.h>                           /* for nanosleep                */
 
 #include "include/ibcomm.h"                 /* header for ibcomm impl.      */
 #include "include/protocol.h"               /* to compute size of msg bufs  */
@@ -486,7 +487,7 @@ int init_rdma_transfer(struct ib_ctx *ibctx, unsigned char *loc_addr,
     /* set the immediate value (generates CQE on remote side)               */
     if (use_imm != 0) {
         /* address window is limited to 4 GiB via this constraint           */
-        swr.imm_data = imm;
+        swr.imm_data = htonl(imm);
     }
 
     ret = ibv_post_send(ibctx->qp, &swr, &bad);
@@ -614,8 +615,10 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
         }
 
         /* suppress successful send operations */
-        if (cqe.opcode == IBV_WC_SEND && cqe.status == IBV_WC_SUCCESS)
+        if (cqe.opcode == IBV_WC_SEND && cqe.status == IBV_WC_SUCCESS) {
+            logmsg(DEBUG, "Skipping send request.");
             poll_res = 0;
+        }
     }
 
     logmsg(DEBUG, "CQE opcode is: %u.", cqe.opcode);
@@ -643,9 +646,15 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
 
 /* Reads the next control message from an InfiniBand queue pair (polling).  */
 int poll_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
+    unsigned int i = 0;
+    struct timespec tspec;                  /* for cancellation purposes    */
+
     int poll_res = 0;                       /* result of IB poll function   */
 
     struct ibv_wc cqe;                      /* completion entry             */
+
+    tspec.tv_sec  = 0;                      /* short sleep for cancel check */
+    tspec.tv_nsec = 500;
 
     /* get the actual event from the CQ */
     while (poll_res == 0) {
@@ -657,8 +666,18 @@ int poll_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
         }
 
         /* suppress successful send operations */
-        if (cqe.opcode == IBV_WC_SEND && cqe.status == IBV_WC_SUCCESS)
+        if (cqe.opcode == IBV_WC_SEND && cqe.status == IBV_WC_SUCCESS) {
+            logmsg(DEBUG, "Skpping send request.");
             poll_res = 0;
+        }
+
+        /* occasionally visit a cancellation point to make sure that the    *
+         * thread is not stuck in the polling routine while the surrounding *
+         * context is shut down                                             */
+        i++;
+        if ((i % 1000) == 0) {
+            nanosleep(&tspec, NULL);
+        }
     }
 
     logmsg(DEBUG, "CQE opcode is: %u.", cqe.opcode);

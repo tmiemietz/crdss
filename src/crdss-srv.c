@@ -681,6 +681,9 @@ static int handle_read(struct handler *handler, uint16_t didx, uint32_t sidx,
         return(1);
     }
 
+    logmsg(DEBUG, "Read input params: didx = %u, sidx = %u, addr = %lu, "
+           "len = %u.", didx, sidx, addr, len);
+
     /* check whether access is allowed */
     pthread_mutex_lock(&handler->cap_lck);
 
@@ -700,6 +703,10 @@ static int handle_read(struct handler *handler, uint16_t didx, uint32_t sidx,
             continue;
         }
         pthread_mutex_unlock(&cap->valid_lck);
+    
+        logmsg(DEBUG, "Cap params: didx = %u, sidx = %u, saddr = %lu, "
+               "eaddr = %lu.", cap->dev_idx, cap->vslc_idx, cap->start_addr,
+               cap->end_addr);
 
         if (cap->dev_idx == didx && 
             cap->vslc_idx == sidx &&
@@ -1615,6 +1622,8 @@ static void *ib_worker(void *ctx) {
                 }
 
                 /* data loaded, send RDMA request */
+                logmsg(DEBUG, "Handler %lu (IBW): Data of read loaded, "
+                       "starting RDMA transfer.", handler->tid);
                 if (init_rdma_transfer(handler->ibctx, 
                     handler->data_buf + rdma_offs, 
                     (unsigned char *) (handler->ibctx->remote_addr + rdma_offs), 
@@ -1630,6 +1639,8 @@ static void *ib_worker(void *ctx) {
                 }
 
                 /* recycle recv request */
+                logmsg(DEBUG, "Handler %lu (IBW): Read request done.",
+                       handler->tid);
                 post_msg_rr(handler->ibctx, msg, 1);
 
                 break;
@@ -1762,16 +1773,23 @@ static void *ib_worker(void *ctx) {
             case MTYPE_COMPLETE:
                 /* completion request for fast read, now write poll field   */
                 logmsg(DEBUG, "Handler %lu: Completed RDMA tansfer for fast "
-                       "read request.", handler->tid);
+                       "read request (imm = %u).", handler->tid, imm);
 
                 /* entry found, write poll field of client */
                 *((unsigned char *) handler->data_buf + imm) = R_SUCCESS;
+                logmsg(DEBUG, "Handler %lu: Writing remote doorbell %p.",
+                      handler->tid, 
+                      (void *) ((uint64_t) handler->ibctx->remote_addr + imm));
+
                 if (write_poll_field(handler->ibctx, 
                     (uint64_t) handler->data_buf + imm,
                     (uint64_t) handler->ibctx->remote_addr + imm) != 0) {
                     logmsg(ERROR, "Handler %lu: Failed to write poll field "
                            "for fast read completion.", handler->tid);
                 }
+
+                logmsg(DEBUG, "Handler %lu: doorbell address written.",
+                       handler->tid);
 
                 break;
             case MTYPE_CPOLL:
@@ -1780,6 +1798,8 @@ static void *ib_worker(void *ctx) {
                 memset(send_buf, 0, MAX_MSG_LEN);
                 send_buf[0] = R_SUCCESS;
                 post_msg_sr(handler->ibctx, send_buf, imm);
+                logmsg(DEBUG, "Handler %lu: switched to polling completion.",
+                       handler->tid);
 
                 /* recycle recv request */
                 post_msg_rr(handler->ibctx, msg, 1);
@@ -1790,6 +1810,8 @@ static void *ib_worker(void *ctx) {
                 memset(send_buf, 0, MAX_MSG_LEN);
                 send_buf[0] = R_SUCCESS;
                 post_msg_sr(handler->ibctx, send_buf, imm);
+                logmsg(DEBUG, "Handler %lu: switched to blocking completion.",
+                       handler->tid);
                 
                 /* recycle recv request */
                 post_msg_rr(handler->ibctx, msg, 1);

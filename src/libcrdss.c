@@ -218,13 +218,19 @@ static void *completion_worker(void *ctx) {
 
     while (1) {
         ret = get_next_ibmsg(&sctx->ibctx, &msg, &imm);
+        printf("comp worker: got new message (imm = %u)!\n", imm);
 
         pthread_mutex_lock(&sctx->wait_lck);
+        printf("comp worker: trying %u wait entries.\n", 
+               slist_length(sctx->wait_workers));
 
         /* try to find worker that wait for imm                             */
         for (lptr = sctx->wait_workers; lptr != NULL; lptr = lptr->next) {
-            struct wctx *wcontext = (struct wctx *) lptr;
+            struct wctx *wcontext = (struct wctx *) lptr->data;
 
+            printf("comp worker: trying entry %p.\n", (void *) wcontext);
+            printf("comp worker: next key of worker is %u.\n", 
+                   wcontext->next_key);
             if (imm == wcontext->next_key) {
                 wcontext->status = ret;
                 wcontext->msg    = msg;
@@ -293,11 +299,13 @@ static int wait_for_ibmsg(struct wctx *wcontext, uint32_t key) {
 
     pthread_mutex_lock(&wcontext->sctx->wait_lck);
 
+    printf("wfibmsg: searching unknown list.\n");
     for (lptr = wcontext->sctx->unknown_compl; lptr != NULL; lptr = lptr->next){
         struct wctx *unknown = (struct wctx *) lptr->data;
     
         /* check if a completion occured meanwhile calling this function    */
         if (unknown->next_key == key) {
+            printf("wfibmsg: matching unknown entry found.\n");
             wcontext->sctx->unknown_compl = 
                 slist_remove(wcontext->sctx->unknown_compl, unknown);
 
@@ -311,6 +319,8 @@ static int wait_for_ibmsg(struct wctx *wcontext, uint32_t key) {
         }
     }
 
+    printf("wfibmsg: inserting thread in wait list (key = %u ptr = %p).\n", 
+           wcontext->next_key, (void *) wcontext);
     if (slist_insert(&wcontext->sctx->wait_workers, wcontext) != 0) {
         pthread_mutex_unlock(&wcontext->sctx->wait_lck);
         return(-1);
@@ -685,7 +695,7 @@ int init_ib_comm(struct crdss_srv_ctx *sctx) {
     }
 
     /* insert all new large buffers into the list of available large buffers*/
-    lbuf_offs = sctx->rdma_buf + sctx->buf_cfg.no_workers + 
+    lbuf_offs = sctx->rdma_buf + sctx->buf_cfg.no_workers * CL_SIZE + 
                 sctx->buf_cfg.no_workers * sctx->buf_cfg.sbuf_size;
     pthread_mutex_lock(&sctx->lbuf_lck);
 
@@ -981,7 +991,7 @@ int fast_read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
     uint64_t rdma_addr_nw;          /* address in RDMA buffer (nw byte ord.)*/
     uint64_t poll_field_nw;         /* doorbell address (network byte ord.) */
 
-    uint8_t *pf_ptr;                /* pointer to poll field                */
+    volatile uint8_t *pf_ptr;       /* pointer to poll field                */
 
     unsigned char msg_buf[MAX_MSG_LEN];     /* message for IB transfer      */
     unsigned char *char_buf;
@@ -1032,14 +1042,17 @@ int fast_read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         /* prepare poll field */
         *pf_ptr = R_UNDEF;
 
+        printf("fast_read_raw: sending request to server.\n");
         if (post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid) != 0) {
             /* failed to post send request */
             return(R_FAILURE);
         }
 
         /* spin in this loop until the result arrived */
-        while (*pf_ptr == R_UNDEF)
+        printf("fast_read_raw: spinning on addr %p.\n", (void *) pf_ptr);
+        while (*pf_ptr == R_UNDEF) 
             ;
+            /* printf("fast_read_raw: value of doorbell is %#x\n", *pf_ptr); */
 
         if (*pf_ptr != R_SUCCESS)
             return(*pf_ptr);
@@ -1067,7 +1080,7 @@ int fast_write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
     uint64_t rdma_rem_addr;         /* target address in remote buffer      */
     uint64_t poll_field_nw;         /* doorbell address (network byte ord.) */
 
-    uint8_t *pf_ptr;                /* pointer to poll field                */
+    volatile uint8_t *pf_ptr;       /* pointer to poll field                */
 
     unsigned char msg_buf[MAX_MSG_LEN];     /* message for IB transfer      */
     unsigned char *char_buf;
@@ -1216,6 +1229,7 @@ int read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
             return(R_FAILURE);
         }
 
+        printf("read_raw: Waiting for answer of server.\n");
         /* wait for answer of server */        
         if (wait_for_ibmsg(work_ctx, work_ctx->tid) != 0) {
             /* receive op failed */
@@ -1223,6 +1237,7 @@ int read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         }
 
         op_res = (work_ctx->status == IBV_WC_SUCCESS) ? R_SUCCESS : R_FAILURE;
+        printf("read_raw: server status is %u.\n", op_res);
         /* repost receive request */
         if (post_msg_rr(&sctx->ibctx, work_ctx->msg, 1) != 0) {
             op_res = R_FAILURE;
@@ -1314,7 +1329,7 @@ int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
 
         /* prepare request buffer */
         memset(msg_buf, 0, MAX_MSG_LEN);
-        msg_buf[0] = MTYPE_FASTWRITE;
+        msg_buf[0] = MTYPE_WRITE;
         memcpy(msg_buf + 1, &didx_nw, sizeof(uint16_t));
         memcpy(msg_buf + 3, &sidx_nw, sizeof(uint32_t));
         memcpy(msg_buf + 7, &saddr_nw, sizeof(uint64_t));
@@ -1324,7 +1339,7 @@ int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         /* transfer data, afterwards send the actual request */
         if (init_rdma_transfer(&sctx->ibctx, (unsigned char *) rdma_addr,
                                (unsigned char *) rdma_rem_addr, cur_len, 
-                               0, 0, 1) != 0) {
+                               0, work_ctx->tid, 1) != 0) {
             return(R_FAILURE);
         }
 
@@ -1333,6 +1348,7 @@ int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
             /* receive op failed */
             return(1);
         }
+        printf("write_raw: data transfer complete, sending msg.\n");
 
         op_res = (work_ctx->status == IBV_WC_SUCCESS) ? R_SUCCESS : R_FAILURE;
         /* repost receive request */
@@ -1362,6 +1378,8 @@ int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
             op_res = R_FAILURE;
             break;
         }
+
+        printf("write_raw: got answer from server (%u).\n", op_res);
 
         if (op_res != R_SUCCESS)
             break;
