@@ -66,8 +66,10 @@
  ****************************************************************************/
 int main(int argc, char **argv) {
     struct crdss_clt_cap cap;
-    struct ib_ctx ibctx;
     struct crdss_srv_ctx *sctx;
+
+    unsigned char *iobuf;
+    size_t buf_len = strlen("Sample Data 123...") + 1;
 
     uint64_t guid = (uint64_t) strtoull(CLT_GUID, NULL, 0);
 
@@ -79,6 +81,12 @@ int main(int argc, char **argv) {
     printf("I am a testing application!\n");
     printf("IB guid is %#lx\n", guid);
 
+    if ((iobuf = malloc(buf_len)) == NULL) {
+        printf("Failed to allocate I/O buffer...\n");
+        return(1);
+    }
+    memset(iobuf, 0, buf_len);
+
     printf("Connecting to capmgr %s...\n", CAPMGR_DOMSOCK);
     if (connect_capmgr_dom(CAPMGR_DOMSOCK) != 0) {
         printf("Failed to connect to capmgr.\n");
@@ -88,19 +96,18 @@ int main(int argc, char **argv) {
 
     /* prepare cap for request */
     memset(&cap, 0, sizeof(struct crdss_clt_cap));
-    memset(&ibctx, 0, sizeof(struct ib_ctx));
     cap.srv.sin_family = AF_INET;
     inet_pton(AF_INET, DEFAULT_SRV, &cap.srv.sin_addr);
     cap.dev_idx    = 0;
     cap.vslc_idx   = 0;
     cap.start_addr = 2;
-    cap.end_addr   = 9;
+    cap.end_addr   = 2047;
     cap.rights     = CAP_READ | CAP_WRITE;
     cap.key        = NULL;
 
     printf("Allocating server context...\n");
     if ((sctx = create_srv_ctx(NULL)) == NULL) {
-        printf("Failed to allocate new server context");
+        printf("Failed to allocate new server context.\n");
         return(1);
     }
     printf("Done.\n");
@@ -114,6 +121,7 @@ int main(int argc, char **argv) {
     printf("Done.\n");
 
     /* set server's IP address before proceeding */
+    sctx->guid                = guid;
     sctx->srv_addr.sin_family = AF_INET;
     sctx->srv_addr.sin_port   = cap.srv.sin_port;
     inet_pton(AF_INET, DEFAULT_SRV, &sctx->srv_addr.sin_addr);    
@@ -142,7 +150,44 @@ int main(int argc, char **argv) {
     printf("Done.\n");
 
     printf("Server responded. RDMA region address on server is %#lx, rkey is "
-           "%#x.\n", ibctx.remote_addr, ibctx.remote_rkey);
+           "%#x.\n", sctx->ibctx.remote_addr, sctx->ibctx.remote_rkey);
+
+    printf("local RDMA base addr is %lu.\n", (uint64_t) sctx->rdma_buf);
+    printf("remote RDMA base addr is %lu.\n", 
+           (uint64_t) sctx->ibctx.remote_addr);
+    printf("Trying read (didx = %u, sidx = %u, saddr = %lu, eaddr = %lu).\n",
+           cap.dev_idx, cap.vslc_idx, cap.start_addr, buf_len - 1);
+
+    if (read_raw(sctx, cap.dev_idx, cap.vslc_idx, 0, iobuf, buf_len - 1) != 0) 
+    {
+        printf("Failed to read from remote device...\n");
+        return(1);
+    }
+    printf("Buffer content after initial read: %s\n", iobuf);
+
+    printf("Rewriting buffer...\n");
+    memset(iobuf, 0, buf_len);
+    memcpy(iobuf, "Yeet and greet O_o", strlen("Yeet and greet O_o"));
+        
+    if (write_raw(sctx, cap.dev_idx, cap.vslc_idx, 0, iobuf, buf_len - 1) 
+        != 0) {
+        printf("Failed to write to remote device...\n");
+        return(1);
+    }
+    printf("Done.\n");
+
+    printf("Re-reading buffer contents (fast path).\n");
+    if (query_srv_block(sctx) != 0) {
+        printf("Failed to switch server to polling mode.\n");
+        return(1);
+    }
+
+    if (fast_read_raw(sctx, cap.dev_idx, cap.vslc_idx, 0, iobuf, 
+        buf_len - 1) != 0) {
+        printf("Failed to re-read buffer (fast path)...\n");
+        return(1);
+    }
+    printf("Buffer content after second reading: %s\n", iobuf);
 
     printf("Closing connection to server...\n");
     if (close_srv_conn(sctx) != 0) {

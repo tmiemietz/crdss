@@ -46,6 +46,7 @@
 /* messages related to InfiniBand */
 #define MTYPE_IBINIT    0x09                /* Initialize communication via *
                                              * InfiniBand                   */
+#define MTYPE_IBCLOSE   0x10                /* close IB connection          */
 
 /* messages for data exchange */
 #define MTYPE_COMPLETE  0x20                /* data transfer is complete    */

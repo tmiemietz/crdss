@@ -62,14 +62,10 @@ struct handler {
     unsigned char *data_buf;                /* buffer for RDMA accesses     */
 
     struct ib_ctx *ibctx;                   /* wrapper for IB structures    */
-
+    
+    unsigned int use_poll;                  /* 1 for completion polling     */
+    unsigned int worker_cnt;                /* number of IB workers         */
     pthread_t *ib_workers;                  /* pointers to IB worker threads*/
-};
-
-/* structure that holds information about a poll field for clt notification */
-struct clt_poll_field {
-    uint64_t key;                           /* key for identifying request  */
-    uint64_t rdma_offs;                     /* offset of poll field         */
 };
 
 /****************************************************************************
@@ -260,43 +256,42 @@ static int check_cap_bounds(uint16_t didx, uint32_t sidx, uint64_t saddr,
 
 /****************************************************************************
  *
- * Gets the type of the next message. In case the connection to the client
- * is run via InfiniBand, the function will wait for an incoming completion
- * entry and set the user-provided message pointer to the buffer 
- * containing the request. The user is responsible for re-queuing the 
+ * Gets the type of the next message received over InfiniBand. The function 
+ * will wait for an incoming completion entry and set the user-provided 
+ * message pointer to the buffer containing the request. 
+ * The user is responsible for re-queuing the 
  * message after processing it to guaranteee that there is a sufficient
- * number of outstanding receive requests. The IB-path in this function will
- * be taken if the handler's IB context is non-NULL. In case the connection
- * is still run via TCP/IP, no reference shall be stored in msg.
+ * number of outstanding receive requests.
  * The message's type will be stored in the integer pointed to by type. This
- * reference must not be NULL.
+ * reference must not be NULL. The same holds for the immediate pointer.
+ * Whether this routine uses polling or blocking completion depends on the
+ * use_poll flag in the handler structure passed to this function.
  *
  * Params: handler - handler structure of the caller.
  *         msg     - pointer for storing the reference to the InfiniBand
  *                   message buffer.
  *         type    - pointer to integer for message type (output parameter).
+ *         imm     - pointer to integer for immediate value received along
+ *                   with the actual message.
  *
  * Returns 0 on success, 1 on error.
  */
 static int get_next_msg_type(struct handler *handler, unsigned char **msg,
-        uint8_t *type) {
-    uint32_t bla;   /* PRELIMINARY, REMOVE LATER !!! */
-
-    if (handler->ibctx == NULL) {
-        /* read type from socket */
-        if (recv(handler->sock, type, 1, MSG_WAITALL) < 1) {
-            logmsg(ERROR, "Handler %lu: Connection terminated (status: %d).",
-                   handler->tid, errno);
+        uint8_t *type, uint32_t *imm) {
+    if (handler->use_poll == 0) {
+        /* blocking completion */
+        if (get_next_ibmsg(handler->ibctx, msg, imm) != 0)
             return(1);
-        }
     }
     else {
-        /* get next IB message */
-        if (get_next_ibmsg(handler->ibctx, msg, &bla) != 0)
+        if (poll_next_ibmsg(handler->ibctx, msg, imm) != 0)
             return(1);
-
-        *type = **msg;
     }
+
+    if (*msg == NULL)
+        *type = MTYPE_COMPLETE;
+    else
+        *type = **msg;
 
     return(0);
 }
@@ -673,8 +668,7 @@ static int handle_drvcap(struct handler *handler, unsigned char *par_id,
  * Returns: An error code as defined in src/include/protocol.h
  */
 static int handle_read(struct handler *handler, uint16_t didx, uint32_t sidx,
-                       uint64_t addr, uint32_t len, uint64_t rdma_offs, 
-                       int signaled) {
+                       uint64_t addr, uint32_t len, uint64_t rdma_offs) {
     unsigned int i;
     size_t offset = 0;                      /* offset in RDMA buffer        */
 
@@ -748,22 +742,13 @@ static int handle_read(struct handler *handler, uint16_t didx, uint32_t sidx,
         rlen = (nr_seq > len) ? len : nr_seq;
         if (pread(dev->fd, handler->data_buf + rdma_offs + offset, rlen, 
             (off_t) lba) == -1) {
-            logmsg(ERROR, "Handler %lu: Failed to read data from devicei (%d).",
+            logmsg(ERROR, "Handler %lu: Failed to read data from device (%d).",
                    handler->tid, errno);
             return(R_FAILURE);
         }
 
         offset += rlen;
         len    -= rlen;
-    }
-
-    /* data loaded, send RDMA request */
-    if (init_rdma_transfer(handler->ibctx, handler->data_buf + rdma_offs, 
-        (unsigned char *) (handler->ibctx->remote_addr + rdma_offs), 
-        len, !signaled, signaled) != 0) {
-        logmsg(ERROR, "Handler %lu: Sending RDMA request failed.",
-               handler->tid);
-        return(R_FAILURE);
     }
 
     return(R_SUCCESS);
@@ -1434,174 +1419,39 @@ static void *ib_worker(void *ctx) {
 
     uint8_t op_res;                         /* result of server operations  */
 
-    unsigned char cap_buf[CAP_ID_LEN];      /* buffer for receiving cap ids */
+    unsigned char send_buf[MAX_MSG_LEN];    /* send buffer for ctrl messages*/
 
     /* fields for reading data from network */
     unsigned char *msg;                     /* buffer for IB message        */
-    uint8_t msg_type;
+    uint8_t  msg_type;                      /* type of next message         */
+    uint32_t imm;                           /* imm. received with last msg. */
+
     uint16_t device_idx;
     uint32_t slice_idx;
     uint64_t saddr;                             /* start address of cap     */
     uint64_t eaddr;                             /* end address of cap       */
     uint16_t cap_rights;
     uint32_t rdom_id;                           /* id of revocation domain  */
-    uint32_t rdmasz;                            /* size of RDMA region as   *
-                                                 * requested by the client  */
-    uint32_t msg_cnt;                           /* no. of msgs requested by *
-                                                 * the client               */
-
-    uint16_t rlid;                              /* LID of peer              */
-    uint32_t rqpn;                              /* QPN of peer              */
-    
-    uint64_t clt_rdma_addr;                     /* address of clt RDMA buf  */
-    uint32_t clt_rkey;                          /* rkey of clt RDMA buf     */
 
     uint32_t length;                            /* length of data operation */
     uint64_t rdma_offs;                         /* offset in RDMA buffer    */
+    uint64_t poll_field;                        /* doorbell address offset  */
 
-    struct slist *open_reqs = NULL;             /* open RDMA requests       */
-    struct slist *lptr;                         /* ptr for list iteration   */
-    struct clt_poll_field *pfield = NULL;       /* poll field structure     */
-
-    logmsg(DEBUG, "Handler %lu: Entering client handler.", handler->tid);
+    logmsg(DEBUG, "Handler %lu: Started IB worker thread.", handler->tid);
     while (1) {
-        if (get_next_msg_type(handler, &msg, &msg_type) != 0) {
-            logmsg(ERROR, "Handler %lu: Unable to read message. Terminating.",
-                   handler->tid);
-            return;
+        if (get_next_msg_type(handler, &msg, &msg_type, &imm) != 0) {
+            logmsg(ERROR, "IB worker: Unable to receive message. Terminating.");
+            return(NULL);
         }
 
         switch (msg_type) {
-            case MTYPE_IBINIT:
-                /* Initializes an InfiniBand connection, if connection is   *
-                 * successful, the server responds with the memory          *
-                 * credentials of the designated receive memory window      */
-                /* important: read data first to keep track of messages,    *
-                 * error handling can be done after reading data from sock  */
-                logmsg(DEBUG, "Handler %lu: Client requests InfiniBand "
-                       "connection.", handler->tid);
-
-                /* if no IB conn is active yet, read parameters from socket */
-                if (recv(handler->sock, &rlid, 2, MSG_WAITALL) < 2) {
-                    logmsg(ERROR, "Handler %lu: Failed to read remote LID.",
-                           handler->tid);
-                    return;
-                }
-                if (recv(handler->sock, &rqpn, 4, MSG_WAITALL) < 4) {
-                    logmsg(ERROR, "Handler %lu: Failed to read remote QPN.",
-                           handler->tid);
-                    return;
-                }
-                if (recv(handler->sock, &msg_cnt, 4, MSG_WAITALL) < 4) {
-                    logmsg(ERROR, "Handler %lu: Failed to read message count.",
-                           handler->tid);
-                    return;
-                }
-                if (recv(handler->sock, &rdmasz, 4, MSG_WAITALL) < 4) {
-                    logmsg(ERROR, "Handler %lu: Failed to read RDMA reg. size.",
-                           handler->tid);
-                    return;
-                }
-
-                /* do nothing if this client already has an IB connection  */
-                if (handler->ibctx != NULL) {
-                    logmsg(WARN, "Handler %lu: Client requested IB connection "
-                           "twice.", handler->tid);
-                    op_res = R_FAILURE;
-                    send(handler->sock, &op_res, 1, 0);
-                    continue;
-                }
-
-                /* client should have at least one capabilitiy registered  */
-                if (slist_empty(handler->caps)) {
-                    logmsg(WARN, "Handler %lu: Client requested IB connection "
-                           "without specifying capabilities.", handler->tid);
-                    op_res = R_FAILURE;
-                    send(handler->sock, &op_res, 1, 0);
-                    continue;
-                }
-
-                /* allocate context and setup data structures */
-                if ((handler->ibctx = malloc(sizeof(struct ib_ctx))) == NULL) {
-                    logmsg(ERROR, "Handler %lu: Failed to allocate IB ctx.",
-                           handler->tid);
-                    op_res = R_FAILURE;
-                    send(handler->sock, &op_res, 1, 0);
-                    continue;
-                }
-
-                /* set connection information to context */
-                handler->ibctx->rem_lid    = ntohs(rlid);
-                handler->ibctx->remote_qpn = ntohl(rqpn);
-                msg_cnt                    = ntohl(msg_cnt);
-
-                if (setup_srv_qp(handler->ibctx, server_conf.guid, 
-                                 &handler->msg_buf, msg_cnt,
-                                 &handler->data_buf, rdmasz) != 0) {
-                    logmsg(ERROR, "Handler %lu: Failed to setup server QP.",
-                           handler->tid);
-                    op_res = R_FAILURE;
-                    send(handler->sock, &op_res, 1, 0);
-                   
-                    /* tear down IB context on error */
-                    destroy_ibctx(handler->ibctx);
-                    free(handler->ibctx);
-                    if (handler->msg_buf != NULL)  free(handler->msg_buf);
-                    if (handler->data_buf != NULL) free(handler->data_buf);
-                    
-                    continue;
-                }
-
-                logmsg(DEBUG, "Handler %lu: Setup IB queue pair for client, "
-                       "RDMA region size is %u.", handler->tid, rdmasz); 
-
-                /* success, send answer to client */
-                op_res = R_SUCCESS;
-                /* reuse rlid and rqpn for answer to client */
-                rlid = htons(handler->ibctx->loc_lid);
-                rqpn = htonl(handler->ibctx->qp->qp_num);
-                send(handler->sock, &op_res, 1, 0);
-                send(handler->sock, &rlid, 2, 0);
-                send(handler->sock, &rqpn, 4, 0);
-
-                /* reuse address variables for transmission of mem conf.    */
-                saddr = (uint64_t) handler->data_buf;   /* buf start addr   */
-                rqpn  = handler->ibctx->rdma_mr->rkey;  /* now rkey         */
-                saddr = htobe64(saddr);
-                rqpn  = htonl(rqpn);
-                send(handler->sock, &saddr, 8, 0);
-                send(handler->sock, &rqpn, 4, 0);
-
-                /* receive memory window information of the client          */
-                if (recv(handler->sock, &clt_rdma_addr, 8, MSG_WAITALL) < 8 ||
-                    recv(handler->sock, &clt_rkey, 4, MSG_WAITALL) < 4) {
-                    logmsg(ERROR, "Handler %lu: Failed to read client answer "
-                           "for exchange of RDMA keys.", handler->tid);
-                    return;
-                }
-                handler->ibctx->remote_addr = be64toh(clt_rdma_addr);
-                handler->ibctx->remote_rkey = ntohl(clt_rkey);
-
-                break;
             case MTYPE_REGCAP:
                 /* register cap with this handler thread                    */
-                logmsg(DEBUG, "Handler %lu: Handling REGCAP request.", 
+                logmsg(DEBUG, "Handler %lu (IBW): Handling REGCAP request.", 
                        handler->tid);
-                if (handler->ibctx == NULL) {
-                    /* TCP path */
-                    if (recv(handler->sock, cap_buf, CAP_ID_LEN, 
-                            MSG_WAITALL) < CAP_ID_LEN) {
-                        logmsg(ERROR, "Handler %lu: Failed to read cap id.",
-                               handler->tid);
-                        return;
-                    }
-
-                    op_res = handle_regcap(handler, cap_buf);
-                }
-                else {
-                    /* IB path, cap ID has one byte offset */
-                    op_res = handle_regcap(handler, msg + 1);
-                }
+                    
+                /* IB path, cap ID has one byte offset */
+                op_res = handle_regcap(handler, msg + 1);
 
                 if (op_res == R_SUCCESS) {
                     logmsg(INFO, "Handler %lu: Registered new cap.", 
@@ -1612,70 +1462,42 @@ static void *ib_worker(void *ctx) {
                            handler->tid, op_res);
                 }
 
-                /* finally send a status answer to the client */
-                if (handler->ibctx == NULL) {
-                    /* TCP path */
-                    send(handler->sock, &op_res, 1, 0);
-                }
-                else {
-                    /* IB path */
-                    /* assemble message */
-                    memcpy(handler->msg_buf, &op_res, sizeof(uint8_t));
-                    post_msg_sr(handler->ibctx, handler->msg_buf);
+                /* send a status answer to the client (via IB message)      */
+                memset(send_buf, 0, MAX_MSG_LEN);
+                memcpy(send_buf, &op_res, sizeof(uint8_t));
+                post_msg_sr(handler->ibctx, send_buf, imm);
 
-                    /* requeue receive request */
-                    post_msg_rr(handler->ibctx, msg, 1);
-                }
+                /* requeue receive request */
+                post_msg_rr(handler->ibctx, msg, 1);
 
                 break;
             case MTYPE_DRVCAP:
                 /* derive a cap from one of the caps that are already       *
                  * registered with this thread. the new cap will have the   *
                  * same revocation domain as its parent                     */
-                if (handler->ibctx == NULL) {
-                    if (recv(handler->sock, cap_buf, CAP_ID_LEN, 
-                             MSG_WAITALL) < CAP_ID_LEN) {
-                        logmsg(ERROR, "Handler %lu: Failed to read parent cap "
-                               "id.", handler->tid);
-                        return;
-                    }
+                /* I know that this way of unmarshalling a message is   *
+                 * obnoxious and it nests the protocol deeply into the  *
+                 * code, but for now, this must suffice                 */
+                device_idx = ntohs(*((uint16_t *) (msg + 1 + CAP_ID_LEN)));
+                slice_idx  = ntohl(*((uint32_t *) (msg + 3 + CAP_ID_LEN)));
+                saddr      = be64toh(*((uint64_t *) (msg + 7 + CAP_ID_LEN)));
+                eaddr      = be64toh(*((uint64_t *) (msg + 15 + CAP_ID_LEN)));
+                cap_rights = ntohs(*((uint16_t *) (msg + 23 + CAP_ID_LEN)));
 
-                    if (read_cap_from_sock(handler->sock, &device_idx, 
-                            &slice_idx, &saddr, &eaddr, &cap_rights) != 0) {
-                        logmsg(ERROR, "Handler %lu: Failed to read capability "
-                           "as requested.", handler->tid);
-                        return;
-                    }
-                }
-                else {
-                    /* I know that this way of unmarshalling a message is   *
-                     * obnoxious and it nests the protocol deeply into the  *
-                     * code, but for now, this must suffice                 */
-                    device_idx = ntohs(*((uint16_t *) (msg + 1 + CAP_ID_LEN)));
-                    slice_idx  = ntohl(*((uint32_t *) (msg + 3 + CAP_ID_LEN)));
-                    saddr      = be64toh(*((uint64_t *) (msg + 7 + CAP_ID_LEN)));
-                    eaddr      = be64toh(*((uint64_t *) (msg + 15 + CAP_ID_LEN)));
-                    cap_rights = ntohs(*((uint16_t *) (msg + 23 + CAP_ID_LEN)));
-                }
-
-                op_res = handle_drvcap(handler, 
-                                (handler->ibctx == NULL) ? cap_buf : msg + 1, 
-                                device_idx, slice_idx, saddr, eaddr, 
-                                cap_rights, &new_cap);
+                op_res = handle_drvcap(handler, msg + 1, device_idx, slice_idx, 
+                                saddr, eaddr, cap_rights, &new_cap);
                 
                 if (op_res != R_SUCCESS) {
                     logmsg(ERROR, "Handler %lu: Cap derivation failed (%u).",
                            handler->tid, op_res);
-                    if (handler->ibctx == NULL) {
-                        send(handler->sock, &op_res, 1, 0);
-                    }
-                    else {
-                        memcpy(handler->msg_buf, &op_res, sizeof(uint8_t));
-                        post_msg_sr(handler->ibctx, handler->msg_buf);
 
-                        /* requeue receive request */
-                        post_msg_rr(handler->ibctx, msg, 1);
-                    }
+                    memset(send_buf, 0, MAX_MSG_LEN);
+                    memcpy(send_buf, &op_res, sizeof(uint8_t));
+                    post_msg_sr(handler->ibctx, send_buf, imm);
+
+                    /* requeue receive request */
+                    post_msg_rr(handler->ibctx, msg, 1);
+                    
                     continue;
                 }
                 else {
@@ -1683,18 +1505,13 @@ static void *ib_worker(void *ctx) {
                            handler->tid, new_cap);
 
                     /* lastly, send the cap id to the capmgr */
-                    if (handler->ibctx == NULL) {
-                        send(handler->sock, &op_res, sizeof(uint8_t), 0);
-                        send(handler->sock, &new_cap->id, CAP_ID_LEN, 0);
-                    }
-                    else {
-                        memcpy(handler->msg_buf, &op_res, sizeof(uint8_t));
-                        memcpy(handler->msg_buf + 1, &new_cap->id, CAP_ID_LEN);
-                        post_msg_sr(handler->ibctx, handler->msg_buf);
+                    memset(send_buf, 0, MAX_MSG_LEN);
+                    memcpy(send_buf, &op_res, sizeof(uint8_t));
+                    memcpy(send_buf + 1, &new_cap->id, CAP_ID_LEN);
+                    post_msg_sr(handler->ibctx, send_buf, imm);
 
-                        /* requeue receive request */
-                        post_msg_rr(handler->ibctx, msg, 1);
-                    }
+                    /* requeue receive request */
+                    post_msg_rr(handler->ibctx, msg, 1);
                 }
 
                 break;
@@ -1706,50 +1523,29 @@ static void *ib_worker(void *ctx) {
                  * rdom the parent cap was assigned to.                     */
                 logmsg(DEBUG, "Handler %lu: Processing DRVCAP2 request.",
                        handler->tid);
-                if (handler->ibctx == NULL) {
-                    if (recv(handler->sock, cap_buf, CAP_ID_LEN, 
-                             MSG_WAITALL) < CAP_ID_LEN) {
-                        logmsg(ERROR, "Handler %lu: Failed to read parent cap "
-                               "id.", handler->tid);
-                        return;
-                    }
+                /* I know that this way of unmarshalling a message is   *
+                 * obnoxious and it nests the protocol deeply into the  *
+                 * code, but for now, this must suffice                 */
+                device_idx = ntohs(*((uint16_t *) (msg + 1 + CAP_ID_LEN)));
+                slice_idx  = ntohl(*((uint32_t *) (msg + 3 + CAP_ID_LEN)));
+                saddr      = be64toh(*((uint64_t *) (msg + 7 + CAP_ID_LEN)));
+                eaddr      = be64toh(*((uint64_t *) (msg + 15 + CAP_ID_LEN)));
+                cap_rights = ntohs(*((uint16_t *) (msg + 23 + CAP_ID_LEN)));
 
-                    if (read_cap_from_sock(handler->sock, &device_idx, 
-                            &slice_idx, &saddr, &eaddr, &cap_rights) != 0) {
-                        logmsg(ERROR, "Handler %lu: Failed to read capability "
-                           "as requested.", handler->tid);
-                        return;
-                    }
-                }
-                else {
-                    /* I know that this way of unmarshalling a message is   *
-                     * obnoxious and it nests the protocol deeply into the  *
-                     * code, but for now, this must suffice                 */
-                    device_idx = ntohs(*((uint16_t *) (msg + 1 + CAP_ID_LEN)));
-                    slice_idx  = ntohl(*((uint32_t *) (msg + 3 + CAP_ID_LEN)));
-                    saddr      = be64toh(*((uint64_t *) (msg + 7 + CAP_ID_LEN)));
-                    eaddr      = be64toh(*((uint64_t *) (msg + 15 + CAP_ID_LEN)));
-                    cap_rights = ntohs(*((uint16_t *) (msg + 23 + CAP_ID_LEN)));
-                }
-
-                op_res = handle_drvcap(handler, 
-                                (handler->ibctx == NULL) ? cap_buf : msg + 1, 
-                                device_idx, slice_idx, saddr, eaddr, 
-                                cap_rights, &new_cap);
+                op_res = handle_drvcap(handler, msg + 1, device_idx, slice_idx, 
+                                saddr, eaddr, cap_rights, &new_cap);
 
                 if (op_res != R_SUCCESS) {
                     logmsg(ERROR, "Handler %lu: Cap derivation failed (%u).",
                            handler->tid, op_res);
-                    if (handler->ibctx == NULL) {
-                        send(handler->sock, &op_res, 1, 0);
-                    }
-                    else {
-                        memcpy(handler->msg_buf, &op_res, sizeof(uint8_t));
-                        post_msg_sr(handler->ibctx, handler->msg_buf);
+                        
+                    memset(send_buf, 0, MAX_MSG_LEN);
+                    memcpy(send_buf, &op_res, sizeof(uint8_t));
+                    post_msg_sr(handler->ibctx, send_buf, imm);
 
-                        /* requeue receive request */
-                        post_msg_rr(handler->ibctx, msg, 1);
-                    }
+                    /* requeue receive request */
+                    post_msg_rr(handler->ibctx, msg, 1);
+                    
                     continue;
                 }
                 else {
@@ -1758,21 +1554,16 @@ static void *ib_worker(void *ctx) {
 
                     /* lastly, send the id of the new cap to the capmgr    */
                     rdom_id = htonl(new_cap->rev_dom->dom_key);
-                    if (handler->ibctx == NULL) {
-                        send(handler->sock, &op_res, sizeof(uint8_t), 0);
-                        send(handler->sock, &new_cap->id, CAP_ID_LEN, 0);
-                        send(handler->sock, &rdom_id, sizeof(uint32_t), 0);
-                    }
-                    else {
-                        memcpy(handler->msg_buf, &op_res, sizeof(uint8_t));
-                        memcpy(handler->msg_buf + 1, &new_cap->id, CAP_ID_LEN);
-                        memcpy(handler->msg_buf + 1 + CAP_ID_LEN, &rdom_id,
-                               sizeof(uint32_t));
-                        post_msg_sr(handler->ibctx, handler->msg_buf);
+                    
+                    memset(send_buf, 0, MAX_MSG_LEN);
+                    memcpy(send_buf, &op_res, sizeof(uint8_t));
+                    memcpy(send_buf + 1, &new_cap->id, CAP_ID_LEN);
+                    memcpy(send_buf + 1 + CAP_ID_LEN, &rdom_id,
+                           sizeof(uint32_t));
+                    post_msg_sr(handler->ibctx, send_buf, imm);
                         
-                        /* requeue receive request */
-                        post_msg_rr(handler->ibctx, msg, 1);
-                    }
+                    /* requeue receive request */
+                    post_msg_rr(handler->ibctx, msg, 1);
                 }
 
                 logmsg(DEBUG, "Handler %lu: transferred new cap %p.",
@@ -1782,16 +1573,7 @@ static void *ib_worker(void *ctx) {
                 /* removes all caps of a certain rev dom from the global cap*
                  * list, destroys the rdoms and renders handler's local     *
                  * copies of caps invalid                                   */
-                if (handler->ibctx == NULL) {
-                    if (recv(handler->sock, &rdom_id,  sizeof(uint32_t), 
-                        MSG_WAITALL) < 2) {
-                        logmsg(ERROR, "Failed to read rdom id as requested.");
-                        return;
-                    }
-                }
-                else {
-                    rdom_id = ntohl(*((uint32_t *) (msg + 1)));
-                }
+                rdom_id = ntohl(*((uint32_t *) (msg + 1)));
                 
                 op_res = handle_rmdom(handler, rdom_id);
                 if (op_res != R_SUCCESS) {
@@ -1799,25 +1581,18 @@ static void *ib_worker(void *ctx) {
                            handler->tid, rdom_id);
                 }
 
-                if (handler->ibctx == NULL) {
-                    send(handler->sock, &op_res, sizeof(uint8_t), 0);
-                }
-                else {
-                    memcpy(handler->msg_buf, &op_res, sizeof(uint8_t));
-                    post_msg_sr(handler->ibctx, handler->msg_buf);
+                memset(send_buf, 0, MAX_MSG_LEN);
+                memcpy(send_buf, &op_res, sizeof(uint8_t));
+                post_msg_sr(handler->ibctx, send_buf, imm);
                         
-                    /* requeue receive request */
-                    post_msg_rr(handler->ibctx, msg, 1);
-                }
+                /* requeue receive request */
+                post_msg_rr(handler->ibctx, msg, 1);
+                
                 break;
             case MTYPE_READ:
                 /* transfer data to the client                              */
-                if (handler->ibctx == NULL) {
-                    logmsg(ERROR, "Handler %lu: Received read request without "
-                           "active IB connection.", handler->tid);
-                    post_msg_rr(handler->ibctx, msg, 1);
-                    break;
-                }
+                logmsg(DEBUG, "Handler %lu: Received READ request.", 
+                       handler->tid);
 
                 device_idx = ntohs(*((uint16_t *) (msg + 1)));
                 slice_idx  = ntohl(*((uint32_t *) (msg + 3)));
@@ -1826,13 +1601,32 @@ static void *ib_worker(void *ctx) {
                 rdma_offs  = be64toh(*((uint64_t *) (msg + 19))) -
                              (uint64_t) handler->ibctx->remote_addr;
 
+                logmsg(DEBUG, "Handler %lu: RDMA offset is %lu, remote addr "
+                       "is %lu.", handler->tid, rdma_offs, 
+                       handler->ibctx->remote_addr);
+
                 op_res = handle_read(handler, device_idx, slice_idx, saddr,
-                                     length, rdma_offs, 0);
+                                     length, rdma_offs);
 
                 if (op_res != R_SUCCESS) {
                     /* send error message as an answer */
-                    memcpy(handler->msg_buf, &op_res, sizeof(uint8_t));
-                    post_msg_sr(handler->ibctx, handler->msg_buf);
+                    memcpy(send_buf, &op_res, sizeof(uint8_t));
+                    post_msg_sr(handler->ibctx, send_buf, imm);
+                }
+
+                /* data loaded, send RDMA request */
+                if (init_rdma_transfer(handler->ibctx, 
+                    handler->data_buf + rdma_offs, 
+                    (unsigned char *) (handler->ibctx->remote_addr + rdma_offs), 
+                    length, 1, imm, 0) != 0) {
+                    logmsg(ERROR, "Handler %lu: Sending RDMA request failed.",
+                            handler->tid);
+                    
+                    op_res = R_FAILURE;
+                    memcpy(send_buf, &op_res, sizeof(uint8_t));
+                    post_msg_sr(handler->ibctx, send_buf, imm);
+
+                    break;
                 }
 
                 /* recycle recv request */
@@ -1841,53 +1635,56 @@ static void *ib_worker(void *ctx) {
                 break;
             case MTYPE_FASTREAD:
                 /* transfer data to the client (polling completion at clt)  */
-                if (handler->ibctx == NULL) {
-                    logmsg(ERROR, "Handler %lu: Received read request without "
-                           "active IB connection.", handler->tid);
-                    post_msg_rr(handler->ibctx, msg, 1);
-                    break;
-                }
-
-                if ((pfield = malloc(sizeof(struct clt_poll_field))) == NULL) {
-                    logmsg(ERROR, "Handler %lu: Failed to allocate poll field "
-                           "structure.", handler->tid);
-                    post_msg_rr(handler->ibctx, msg, 1);
-                    break;
-                } 
-
                 device_idx = ntohs(*((uint16_t *) (msg + 1)));
                 slice_idx  = ntohl(*((uint32_t *) (msg + 3)));
                 saddr      = be64toh(*((uint64_t *) (msg + 7)));
                 length     = ntohl(*((uint32_t *) (msg + 15)));
                 rdma_offs  = be64toh(*((uint64_t *) (msg + 19))) - 
                              (uint64_t) handler->ibctx->remote_addr;
+                poll_field = be64toh(*((uint64_t *) (msg + 27))) -
+                             (uint64_t) handler->ibctx->remote_addr;
+
+                if (poll_field > (handler->ibctx->rdma_mr->length - 1)) {
+                    logmsg(ERROR, "Handler %lu: Unable to set up poll field", 
+                           handler->tid);
+                    break;
+                }
 
                 op_res = handle_read(handler, device_idx, slice_idx, saddr,
-                                     length, rdma_offs, 1);
-                pfield->key = rdma_offs;
+                                     length, rdma_offs);
 
                 if (op_res != R_SUCCESS) {
-                    /* send error message as an answer */
+                    /* write error number to client-side doorbell */
                     logmsg(ERROR, "Handler %lu: Read request failed.", 
                            handler->tid);
-                    memcpy(handler->msg_buf, &op_res, sizeof(uint8_t));
-                    post_msg_sr(handler->ibctx, handler->msg_buf);
+                    memcpy((unsigned char *) handler->data_buf + poll_field, 
+                           &op_res, sizeof(uint8_t));
                     
-                    free(pfield);
+                    if (write_poll_field(handler->ibctx, 
+                        (uint64_t) handler->data_buf + poll_field,
+                        (uint64_t) handler->ibctx->remote_addr + poll_field) != 0){
+                        logmsg(ERROR, "Handler %lu: Failed to write poll field.",
+                               handler->tid);
+                    }
                     post_msg_rr(handler->ibctx, msg, 1);
                     break;
                 }
 
-                /* rdma offset now becomes offset for poll field */
-                rdma_offs  = be64toh(*((uint64_t *) (msg + 27))) -
-                             (uint64_t) handler->ibctx->remote_addr;
-                pfield->rdma_offs = rdma_offs;
-                
-                if (rdma_offs > (handler->ibctx->rdma_mr->length - 1) || 
-                    slist_insert(&open_reqs, pfield) != 0) {
-                    logmsg(ERROR, "Handler %lu: Unable to set up poll field", 
-                           handler->tid);
-                    free(pfield);
+                if (init_rdma_transfer(handler->ibctx, 
+                    handler->data_buf + rdma_offs, 
+                    (unsigned char *) (handler->ibctx->remote_addr + rdma_offs), 
+                    length, 0, (uint32_t) poll_field, 1) != 0) {
+                    logmsg(ERROR, "Handler %lu: Sending RDMA request failed.",
+                            handler->tid);
+                    
+                    if (write_poll_field(handler->ibctx, 
+                        (uint64_t) handler->data_buf + poll_field,
+                        (uint64_t) handler->ibctx->remote_addr + poll_field) != 0){
+                        logmsg(ERROR, "Handler %lu: Failed to write poll field.",
+                               handler->tid);
+                    }
+                    post_msg_rr(handler->ibctx, msg, 1);
+                    break;
                 }
 
                 /* recycle recv request */
@@ -1916,9 +1713,9 @@ static void *ib_worker(void *ctx) {
                 /* regardless of the outcome of the operation, send the     *
                  * status and the rdma offset (for identification on clt    *
                  * side) back to the requester                              */
-                memcpy(handler->msg_buf, &op_res, sizeof(uint8_t));
-                memcpy(handler->msg_buf + 1, &rdma_offs, sizeof(uint64_t));
-                post_msg_sr(handler->ibctx, handler->msg_buf);
+                memcpy(send_buf, &op_res, sizeof(uint8_t));
+                memcpy(send_buf + 1, &rdma_offs, sizeof(uint64_t));
+                post_msg_sr(handler->ibctx, send_buf, imm);
 
                 /* recycle recv request */
                 post_msg_rr(handler->ibctx, msg, 1);
@@ -1943,18 +1740,18 @@ static void *ib_worker(void *ctx) {
                                       length, rdma_offs);
 
                 /* rdma offset now becomes offset for poll field */
-                rdma_offs  = be64toh(*((uint64_t *) (msg + 27))) - 
+                poll_field = be64toh(*((uint64_t *) (msg + 27))) - 
                              (uint64_t) handler->ibctx->remote_addr;
-                if (rdma_offs > (handler->ibctx->rdma_mr->length - 1)) {
+                if (poll_field > (handler->ibctx->rdma_mr->length - 1)) {
                     logmsg(ERROR, "Handler %lu: Invalid poll field in write.",
                            handler->tid);
                     op_res = R_INVAL;
                 }
 
-                *((unsigned char *) handler->data_buf + rdma_offs) = op_res;
+                *((unsigned char *) handler->data_buf + poll_field) = op_res;
                 if (write_poll_field(handler->ibctx, 
-                    (uint64_t) handler->data_buf + rdma_offs,
-                    (uint64_t) handler->ibctx->remote_addr + rdma_offs) != 0) {
+                    (uint64_t) handler->data_buf + poll_field,
+                    (uint64_t) handler->ibctx->remote_addr + poll_field) != 0) {
                     logmsg(ERROR, "Handler %lu: Failed to write poll field.",
                            handler->tid);
                 }
@@ -1964,52 +1761,204 @@ static void *ib_worker(void *ctx) {
                 break;
             case MTYPE_COMPLETE:
                 /* completion request for fast read, now write poll field   */
-                /* message is artificially allocated on this side, free it! */
-                logmsg(DEBUG, "Handler %lu: Completed RDMA tansfer for read "
-                       "request.", handler->tid);
-                rdma_offs = *((uint64_t *) msg + 1);
-
-                for (lptr = open_reqs; lptr != NULL; lptr = lptr->next) {
-                    pfield = (struct clt_poll_field *) lptr->data;
-
-                    if (pfield->key == rdma_offs)
-                        break;
-                }
-
-                if (lptr == NULL) {
-                    logmsg(ERROR, "Handler %lu: Completion key not found.",
-                           handler->tid);
-                    free(msg);
-                    break;
-                }
+                logmsg(DEBUG, "Handler %lu: Completed RDMA tansfer for fast "
+                       "read request.", handler->tid);
 
                 /* entry found, write poll field of client */
-                *((unsigned char *) handler->data_buf + pfield->key) = op_res;
+                *((unsigned char *) handler->data_buf + imm) = R_SUCCESS;
                 if (write_poll_field(handler->ibctx, 
-                    (uint64_t) handler->data_buf + pfield->key,
-                    (uint64_t) handler->ibctx->remote_addr + pfield->key) != 0){
-                    logmsg(ERROR, "Handler %lu: Failed to write poll field.",
-                           handler->tid);
+                    (uint64_t) handler->data_buf + imm,
+                    (uint64_t) handler->ibctx->remote_addr + imm) != 0) {
+                    logmsg(ERROR, "Handler %lu: Failed to write poll field "
+                           "for fast read completion.", handler->tid);
                 }
 
-                /* remove poll field write request from list */
-                open_reqs = slist_remove(open_reqs, pfield);
-                free(pfield);
-                free(msg);
-
                 break;
-            case MTYPE_BYE:
-                logmsg(INFO, "Handler %lu: Client requested shutdown.",
-                       handler->tid);
-                return;
+            case MTYPE_CPOLL:
+                handler->use_poll = 1;
+
+                memset(send_buf, 0, MAX_MSG_LEN);
+                send_buf[0] = R_SUCCESS;
+                post_msg_sr(handler->ibctx, send_buf, imm);
+
+                /* recycle recv request */
+                post_msg_rr(handler->ibctx, msg, 1);
+                break;
+            case MTYPE_CBLOCK:
+                handler->use_poll = 0;
+
+                memset(send_buf, 0, MAX_MSG_LEN);
+                send_buf[0] = R_SUCCESS;
+                post_msg_sr(handler->ibctx, send_buf, imm);
+                
+                /* recycle recv request */
+                post_msg_rr(handler->ibctx, msg, 1);
+                break;
             default:
                 logmsg(WARN, "Handler %lu: Received unknown message type %u.",
                        handler->tid, msg_type);
-                return;
+                
+                /* recycle recv request */
+                post_msg_rr(handler->ibctx, msg, 1);
+                break;
         }
     }
 
     return(NULL);
+}
+
+/****************************************************************************
+ *
+ * Performs the setup of an InfiniBand connection. Data necessary for
+ * establishing an RC queue pair is exchanged over the TCP connection of the
+ * handler object. The function will spawn the InfiniBand worker threads.
+ *
+ * Params: handler - context for the client connection.
+ *
+ * Returns: An error code as specified in src/include/protocol.h
+ */
+static int handle_ibinit(struct handler *handler) {
+    uint16_t rlid;                          /* LID of client queue pair     */
+    uint32_t rqpn;                          /* QPN of client queue pair     */
+    uint32_t msg_cnt;                       /* capacity of IB message buf.  */
+    uint32_t rdmasz;                        /* size of RDMA memory region   */
+    uint16_t worker_cnt;                    /* requested no. of IB workers  */
+    
+    /* always read parameters from socket to retain message bounds */
+    if (recv(handler->sock, &rlid, 2, MSG_WAITALL) < 2) {
+        logmsg(ERROR, "Handler %lu: Failed to read remote LID.",
+               handler->tid);
+        return(R_FAILURE);
+    }
+    if (recv(handler->sock, &rqpn, 4, MSG_WAITALL) < 4) {
+        logmsg(ERROR, "Handler %lu: Failed to read remote QPN.",
+               handler->tid);
+        return(R_FAILURE);
+    }
+    if (recv(handler->sock, &msg_cnt, 4, MSG_WAITALL) < 4) {
+        logmsg(ERROR, "Handler %lu: Failed to read message count.",
+               handler->tid);
+        return(R_FAILURE);
+    }
+    if (recv(handler->sock, &rdmasz, 4, MSG_WAITALL) < 4) {
+        logmsg(ERROR, "Handler %lu: Failed to read RDMA reg. size.",
+               handler->tid);
+        return(R_FAILURE);
+    }
+    if (recv(handler->sock, &worker_cnt, 2, MSG_WAITALL) < 2) {
+        logmsg(ERROR, "Handler %lu: Failed to read worker count.",
+               handler->tid);
+        return(R_FAILURE);
+    }
+
+    /* do nothing if this client already has an IB connection  */
+    if (handler->ibctx != NULL) {
+        logmsg(WARN, "Handler %lu: Client requested IB connection "
+              "twice.", handler->tid);
+        return(R_INVAL);
+    }
+
+    /* client should have at least one capabilitiy registered  */
+    if (slist_empty(handler->caps)) {
+        logmsg(WARN, "Handler %lu: Client requested IB connection "
+               "without specifying capabilities.", handler->tid);
+        return(R_PERM);
+    }
+
+    /* check if requested number of workers exceeds server limit */
+    if (ntohs(worker_cnt) > MAX_SRV_WORKERS) {
+        logmsg(ERROR, "Handler %lu: Client requested too many workers (%u). "
+               "The limit is %u.", handler->tid, ntohs(worker_cnt), 
+               MAX_SRV_WORKERS);
+        return(R_PERM);
+    }
+
+    /* allocate context and setup data structures */
+    if ((handler->ibctx = calloc(1, sizeof(struct ib_ctx))) == NULL) {
+        logmsg(ERROR, "Handler %lu: Failed to allocate IB ctx.", handler->tid);
+        return(R_FAILURE);
+    }
+
+    /* set connection information in context */
+    handler->ibctx->rem_lid    = ntohs(rlid);
+    handler->ibctx->remote_qpn = ntohl(rqpn);
+    msg_cnt                    = ntohl(msg_cnt);
+    rdmasz                     = ntohl(rdmasz);
+    handler->worker_cnt        = ntohs(worker_cnt);
+
+    handler->ib_workers = calloc(handler->worker_cnt, sizeof(pthread_t));
+    if (handler->ib_workers == NULL) {
+        logmsg(ERROR, "Handler %lu: Failed to allocate IB worker threads.",
+               handler->tid);
+        free(handler->ibctx);
+        return(R_FAILURE);
+    }
+
+    if (setup_srv_qp(handler->ibctx, server_conf.guid, &handler->msg_buf, 
+                     msg_cnt, &handler->data_buf, rdmasz) != 0) {
+        logmsg(ERROR, "Handler %lu: Failed to setup server QP.", handler->tid);
+                   
+        /* tear down IB context on error */
+        goto setup_error;
+    }
+
+    logmsg(DEBUG, "Handler %lu: Setup IB queue pair for client, "
+           "RDMA region size is %u.", handler->tid, rdmasz); 
+
+
+    return(R_SUCCESS);
+
+setup_error:
+    destroy_ibctx(handler->ibctx);
+    free(handler->ibctx);
+    free(handler->ib_workers);
+    if (handler->msg_buf != NULL)  free(handler->msg_buf);
+    if (handler->data_buf != NULL) free(handler->data_buf);
+                  
+    return(R_FAILURE);
+}
+
+/****************************************************************************
+ * 
+ * Closes an InfiniBand connection to a client. This will cancel all IB
+ * worker threads associated with this handler. Memory regions are 
+ * unregostered and deallocated. The InfiniBand context of the handler will
+ * be deallocated as well. The function will do nothing if the handler
+ * has no active IB connection.
+ *
+ * Params: handler - context of handler.
+ */
+static void close_ib_conn(struct handler *handler) {
+    unsigned int i;
+    void *res;                      /* result of worker threads             */
+
+    if (handler == NULL || handler->ibctx == NULL)
+        return;
+
+    /* kill InfiniBand worker threads */
+    logmsg(DEBUG, "Handler %lu: Killing %u IB worker threads.", handler->tid,
+           handler->worker_cnt);
+    for (i = 0; i < handler->worker_cnt; i++) {
+        pthread_cancel(handler->ib_workers[i]);
+        pthread_join(handler->ib_workers[i], &res);
+    }
+    free(handler->ib_workers);
+    handler->ib_workers = NULL;
+
+    if (destroy_ibctx(handler->ibctx) != 0) {
+        logmsg(WARN, "Handler %lu: Teardown of IB conn. failed.", 
+               handler->tid);
+    }
+
+    if (handler->ibctx != NULL)    free(handler->ibctx);
+    if (handler->msg_buf != NULL)  free(handler->msg_buf);
+    if (handler->data_buf != NULL) free(handler->data_buf);
+
+    handler->ibctx    = NULL;
+    handler->msg_buf  = NULL;
+    handler->data_buf = NULL;
+
+    return;
 }
 
 /****************************************************************************
@@ -2022,6 +1971,8 @@ static void *ib_worker(void *ctx) {
  * Params: handler - context structure for client connection.
  */
 static void handle_normal_clt(struct handler *handler) {
+    unsigned int i;
+
     struct crdss_srv_cap *new_cap;          /* pointer to new capability    */
 
     uint8_t op_res;                         /* result of server operations  */
@@ -2029,31 +1980,20 @@ static void handle_normal_clt(struct handler *handler) {
     unsigned char cap_buf[CAP_ID_LEN];      /* buffer for receiving cap ids */
 
     /* fields for reading data from network */
-    unsigned char *msg;                     /* buffer for IB message        */
-    uint8_t msg_type;
+    uint8_t  msg_type;
     uint16_t device_idx;
     uint32_t slice_idx;
     uint64_t saddr;                             /* start address of cap     */
     uint64_t eaddr;                             /* end address of cap       */
     uint16_t cap_rights;
     uint32_t rdom_id;                           /* id of revocation domain  */
-    uint32_t rdmasz;                            /* size of RDMA region as   *
-                                                 * requested by the client  */
-    uint32_t msg_cnt;                           /* no. of msgs requested by *
-                                                 * the client               */
 
     uint16_t rlid;                              /* LID of peer              */
     uint32_t rqpn;                              /* QPN of peer              */
     
     uint64_t clt_rdma_addr;                     /* address of clt RDMA buf  */
     uint32_t clt_rkey;                          /* rkey of clt RDMA buf     */
-
-    uint32_t length;                            /* length of data operation */
-    uint64_t rdma_offs;                         /* offset in RDMA buffer    */
-
-    struct slist *open_reqs = NULL;             /* open RDMA requests       */
-    struct slist *lptr;                         /* ptr for list iteration   */
-    struct clt_poll_field *pfield = NULL;       /* poll field structure     */
+    uint32_t rkey;                              /* rkey of local RDMA buf.  */
 
     logmsg(DEBUG, "Handler %lu: Entering client handler.", handler->tid);
     while (1) {
@@ -2062,7 +2002,6 @@ static void handle_normal_clt(struct handler *handler) {
             logmsg(ERROR, "Handler %lu: Connection terminated (status: %s).", 
                    handler->tid, strerror(errno));
             
-            /* XXX insert IB teardown function here XXX */
             return;
         }
         
@@ -2076,106 +2015,53 @@ static void handle_normal_clt(struct handler *handler) {
                 logmsg(DEBUG, "Handler %lu: Client requests InfiniBand "
                        "connection.", handler->tid);
 
-                /* if no IB conn is active yet, read parameters from socket */
-                if (recv(handler->sock, &rlid, 2, MSG_WAITALL) < 2) {
-                    logmsg(ERROR, "Handler %lu: Failed to read remote LID.",
-                           handler->tid);
-                    return;
-                }
-                if (recv(handler->sock, &rqpn, 4, MSG_WAITALL) < 4) {
-                    logmsg(ERROR, "Handler %lu: Failed to read remote QPN.",
-                           handler->tid);
-                    return;
-                }
-                if (recv(handler->sock, &msg_cnt, 4, MSG_WAITALL) < 4) {
-                    logmsg(ERROR, "Handler %lu: Failed to read message count.",
-                           handler->tid);
-                    return;
-                }
-                if (recv(handler->sock, &rdmasz, 4, MSG_WAITALL) < 4) {
-                    logmsg(ERROR, "Handler %lu: Failed to read RDMA reg. size.",
-                           handler->tid);
-                    return;
-                }
+                op_res = handle_ibinit(handler);
 
-                /* do nothing if this client already has an IB connection  */
-                if (handler->ibctx != NULL) {
-                    logmsg(WARN, "Handler %lu: Client requested IB connection "
-                           "twice.", handler->tid);
-                    op_res = R_FAILURE;
+                if (op_res != R_SUCCESS) {
                     send(handler->sock, &op_res, 1, 0);
                     continue;
-                }
+                }       
 
-                /* client should have at least one capabilitiy registered  */
-                if (slist_empty(handler->caps)) {
-                    logmsg(WARN, "Handler %lu: Client requested IB connection "
-                           "without specifying capabilities.", handler->tid);
-                    op_res = R_FAILURE;
-                    send(handler->sock, &op_res, 1, 0);
-                    continue;
-                }
-
-                /* allocate context and setup data structures */
-                if ((handler->ibctx = malloc(sizeof(struct ib_ctx))) == NULL) {
-                    logmsg(ERROR, "Handler %lu: Failed to allocate IB ctx.",
-                           handler->tid);
-                    op_res = R_FAILURE;
-                    send(handler->sock, &op_res, 1, 0);
-                    continue;
-                }
-
-                /* set connection information to context */
-                handler->ibctx->rem_lid    = ntohs(rlid);
-                handler->ibctx->remote_qpn = ntohl(rqpn);
-                msg_cnt                    = ntohl(msg_cnt);
-
-                if (setup_srv_qp(handler->ibctx, server_conf.guid, 
-                                 &handler->msg_buf, msg_cnt,
-                                 &handler->data_buf, rdmasz) != 0) {
-                    logmsg(ERROR, "Handler %lu: Failed to setup server QP.",
-                           handler->tid);
-                    op_res = R_FAILURE;
-                    send(handler->sock, &op_res, 1, 0);
-                   
-                    /* tear down IB context on error */
-                    destroy_ibctx(handler->ibctx);
-                    free(handler->ibctx);
-                    if (handler->msg_buf != NULL)  free(handler->msg_buf);
-                    if (handler->data_buf != NULL) free(handler->data_buf);
-                    
-                    continue;
-                }
-
-                logmsg(DEBUG, "Handler %lu: Setup IB queue pair for client, "
-                       "RDMA region size is %u.", handler->tid, rdmasz); 
-
-                /* success, send answer to client */
-                op_res = R_SUCCESS;
                 /* reuse rlid and rqpn for answer to client */
                 rlid = htons(handler->ibctx->loc_lid);
                 rqpn = htonl(handler->ibctx->qp->qp_num);
-                send(handler->sock, &op_res, 1, 0);
+                send(handler->sock, &op_res, 1, 0);       /* sends R_SUCCESS*/
                 send(handler->sock, &rlid, 2, 0);
                 send(handler->sock, &rqpn, 4, 0);
 
                 /* reuse address variables for transmission of mem conf.    */
                 saddr = (uint64_t) handler->data_buf;   /* buf start addr   */
-                rqpn  = handler->ibctx->rdma_mr->rkey;  /* now rkey         */
+                rkey  = handler->ibctx->rdma_mr->rkey;  /* now rkey         */
                 saddr = htobe64(saddr);
-                rqpn  = htonl(rqpn);
+                rkey  = htonl(rkey);
                 send(handler->sock, &saddr, 8, 0);
-                send(handler->sock, &rqpn, 4, 0);
+                send(handler->sock, &rkey, 4, 0);
 
                 /* receive memory window information of the client          */
                 if (recv(handler->sock, &clt_rdma_addr, 8, MSG_WAITALL) < 8 ||
                     recv(handler->sock, &clt_rkey, 4, MSG_WAITALL) < 4) {
                     logmsg(ERROR, "Handler %lu: Failed to read client answer "
                            "for exchange of RDMA keys.", handler->tid);
+                    
+                    /* maybe just tear down the IB connection without       *
+                     * cancelling the whole handler?                        */
                     return;
                 }
+                logmsg(DEBUG, "Received clt_rdma_addr: %lu", clt_rdma_addr);
                 handler->ibctx->remote_addr = be64toh(clt_rdma_addr);
                 handler->ibctx->remote_rkey = ntohl(clt_rkey);
+
+                /* start IB worker threads */
+                logmsg(DEBUG, "Handler %lu: Creating %u IB worker threads.",
+                    handler->tid, handler->worker_cnt);
+                for (i = 0; i < handler->worker_cnt; i++) {
+                    if (pthread_create(&handler->ib_workers[i], NULL, ib_worker, 
+                        handler) != 0) {
+                        logmsg(ERROR, "Handler %lu: Failed to start IB workers.",
+                            handler->tid);
+                        close_ib_conn(handler);
+                    }
+                }
 
                 break;
             case MTYPE_REGCAP:
@@ -2309,12 +2195,15 @@ static void handle_normal_clt(struct handler *handler) {
                 send(handler->sock, &op_res, sizeof(uint8_t), 0);
                 
                 break;
+            case MTYPE_IBCLOSE:
+                logmsg(INFO, "Handler %lu: Client requested teardown of IB "
+                       "queue pairs. Keeping TCP connection.", handler->tid);
+                close_ib_conn(handler);
+
+                break;
             case MTYPE_BYE:
                 logmsg(INFO, "Handler %lu: Client requested shutdown.",
                        handler->tid);
-
-                /* XXX insert IB teardown function here XXX */
-
                 return;
             default:
                 logmsg(WARN, "Handler %lu: Received unknown message type %u.",
@@ -2475,12 +2364,7 @@ end:
     pthread_mutex_unlock(&this->cap_lck);
 
     logmsg(DEBUG, "Handler %lu: Deleted caps, closing IB conn.", this->tid);
-    if (destroy_ibctx(this->ibctx) != 0)
-        logmsg(WARN, "Handler %lu: Teardown of IB conn. failed.", this->tid);
-
-    if (this->ibctx != NULL)   free(this->ibctx);
-    if (this->msg_buf != NULL) free(this->msg_buf);
-    if (this->msg_buf != NULL) free(this->data_buf);
+    close_ib_conn(this);
 
     close(this->sock);
 

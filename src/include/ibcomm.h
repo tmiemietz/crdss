@@ -40,6 +40,8 @@
                                          * supported for a single msg buffer*
                                          * i.e., for a single connection    */
 
+#define MAX_SRV_WORKERS 512             /* max IB workers per clt on server */
+
 /* preliminary, hardcoded values to indicate which pkey to use, change later*/
 #define CRDSS_PKEY_IDX 0
 
@@ -188,9 +190,11 @@ int post_msg_sr(struct ib_ctx *ibctx, unsigned char *msg_addr, uint32_t imm);
  *
  * Initiates an RDMA transfer to the remote side connected to the queue pair
  * in the InfiniBand context structure provided to this function. 
- * The transfer can be used with a immediate value that tells the remote side
- * the memory address where the contents of the local input buffer have been
- * stored.
+ * The transfer can be used with a immediate value that provides the remote
+ * side with information about which requests has been finished. The caller
+ * can requested signaled sending (e.g. useful on the server side when
+ * waiting for a read data transmission to finish). In this case the WR ID
+ * will be the immediate value imm instead of the RDMA buffer offset.
  *
  * Params: ibctx    - mantle structure for IB context.
  *         loc_addr - address of local buffer.
@@ -198,7 +202,7 @@ int post_msg_sr(struct ib_ctx *ibctx, unsigned char *msg_addr, uint32_t imm);
  *         length   - amount of data to transmit.
  *         use_imm  - if != 0 use an RDMA with immediate operation to tell
  *                    the remote side about this operation.
- *         imm      - immediate value to send. ignored if use_imm == 0
+ *         imm      - immediate value to send.
  *         signaled - if != 0, a completion event for the RDMA op will be
  *                    generated in the sender's CQ.
  *
@@ -255,5 +259,23 @@ int destroy_ibctx(struct ib_ctx *ibctx);
  *          a positive number if the completion request contained an error.
  */
 int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm);
+
+/****************************************************************************
+ *
+ * Reads the next control message from the InfiniBand queue pair contained
+ * in ibctx. The InfiniBand context is expected to be fully initialized.
+ * This function actively polls the completion queue of the IB context, which
+ * leads to a significantly higher CPU utilization in exchange for better
+ * latency. If the message received comes with an immediate value, it is 
+ * stored in the location referenced by imm.
+ *
+ * Params: ibctx - InfiniBand context of the calling handler thread.
+ *         msg   - points to a pointer where the message start shall be saved.
+ *         imm   - immediate value received with last message.
+ *
+ * Returns: 0 on success, -1 on internal error (e.g. failing to poll the CQ), 
+ *          a positive number if the completion request contained an error.
+ */
+int poll_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm);
 
 #endif /* IBCOMM_H */

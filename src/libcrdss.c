@@ -720,8 +720,6 @@ int init_ib_comm(struct crdss_srv_ctx *sctx) {
 /* Closes a connection to a CRDSS storage server.                           */
 int close_srv_conn(struct crdss_srv_ctx *sctx) {
     uint8_t opcode = MTYPE_BYE;             /* ID for server operation      */
-    unsigned char msg_buf[MAX_MSG_LEN];     /* msg for IB transfer          */
-    void   *handler_res;                    /* result of compl. handler     */
 
     pthread_mutex_lock(&sctx->tcp_lck);
 
