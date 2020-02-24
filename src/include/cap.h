@@ -76,6 +76,8 @@ struct crdss_srv_cap {
                                              * (set via single bits)        */
     struct rev_dom_node *rev_dom;           /* revocation domain of this cap*/
 
+    /* 1 if cap is valid, 0 if cap is invalid and destruction is not started*
+     * -1 if cap is invalid and its removal is scheduled                    */
     char valid;                             /* indicates whether this cap is*
                                              * still valid                  */
     pthread_mutex_t valid_lck;              /* grab this for making the cap *

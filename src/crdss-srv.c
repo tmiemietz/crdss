@@ -51,7 +51,7 @@ struct handler {
     
     struct slist *caps;                     /* list of crdss_srv_caps       *
                                              * handled by this thread       */
-    pthread_mutex_t cap_lck;                /* lock for capability list     */
+    pthread_rwlock_t cap_lck;               /* lock for capability list     */
 
     /*** IP-related fields ****/
     int       sock;                         /* IP socket for control path   */
@@ -296,7 +296,73 @@ static int get_next_msg_type(struct handler *handler, unsigned char **msg,
     return(0);
 }
 
-/***************************************************************************
+/****************************************************************************
+ *
+ * Retrieves the size of a vslice. Currently, this is the handler method for
+ * VSLCINFO requests. If the function succeeds, the size of the vslice 
+ * queried will be stored in size, a user-provided pointer that must not be
+ * NULL. Reasons for failure are invalid indices vor the device and the 
+ * slice or internal errors.
+ *
+ * Params: didx - index of device that contains the vslice.
+ *         sidx - index of the vslice to query.
+ *         size - size of the requested vslice (output parameter).
+ *
+ * Returns: 0 on success, 1 on error.
+ */
+static int get_vslc_size(uint16_t didx, uint32_t sidx, uint64_t *size) {
+    unsigned int i;
+    struct slist *lptr = devs;
+    struct crdss_bdev *dev;
+
+    struct vslc_info *slc_info;         /* information on active vslices    */
+    struct vslice    *slice;
+
+    /* check if size is a null pointer */
+    if (size == NULL)
+        return(1);
+
+    /* check if dev index is already out of bounds */
+    if (slist_empty(devs) || didx > (slist_length(devs) - 1))
+        return(1);
+
+    /* move to requested device and get information about its vslices */
+    for (i = 0; i < didx; i++)
+        lptr = lptr->next;
+
+    dev      = (struct crdss_bdev *) lptr->data;
+    slc_info = dev->ops.info(dev);
+
+    if (slc_info == NULL) {
+        logmsg(ERROR, "get_vslc_size: Failed to acquire vslice info...");
+        return(1);
+    }
+
+    /* check if there exist vslices and if so if slc idx is out of bounds   */
+    if (slist_empty(slc_info->vslc) || 
+        sidx > (slist_length(slc_info->vslc) - 1)) {
+        return(1);
+    }
+
+    lptr = slc_info->vslc;
+    for (i = 0; i < sidx; i++) 
+        lptr = lptr->next;
+
+    /* check if byte addresses are out of bound */
+    slice = (struct vslice *) lptr->data;
+    *size = slice->size;
+    
+    /* clean up vslice info struct before returning */
+    while (slc_info->vslc != NULL) {
+        free(slc_info->vslc->data);
+        slc_info->vslc = slist_remove(slc_info->vslc, slc_info->vslc->data);
+    }
+    free(slc_info);
+
+    return(0);
+}
+
+/****************************************************************************
  * 
  * Inserts a new capability into the server's management structures. Both
  * new_cap and new_loc_cap are expected to contain the same values.
@@ -401,9 +467,9 @@ static int register_cap_with_dom(struct handler *handler,
     }
                 
     /* insert new capability in local cap list of handler                   */
-    pthread_mutex_lock(&handler->cap_lck);
+    pthread_rwlock_rdlock(&handler->cap_lck);
     if (slist_insert(&handler->caps, new_cap_loc)) {
-        pthread_mutex_unlock(&handler->cap_lck);
+        pthread_rwlock_unlock(&handler->cap_lck);
         cap_list = slist_remove(cap_list, new_cap);
         pthread_mutex_unlock(&cap_lck);
 
@@ -414,7 +480,7 @@ static int register_cap_with_dom(struct handler *handler,
         return(R_FAILURE);
     }
 
-    pthread_mutex_unlock(&handler->cap_lck);
+    pthread_rwlock_unlock(&handler->cap_lck);
     pthread_mutex_unlock(&cap_lck);
     return(R_SUCCESS);
 }
@@ -466,11 +532,11 @@ static int handle_regcap(struct handler *handler, unsigned char *id_buf) {
         return(R_INVAL);
     }
 
-    pthread_mutex_lock(&handler->cap_lck);
+    pthread_rwlock_wrlock(&handler->cap_lck);
 
     /* first try insertion into handler-local cap list                      */
     if (slist_insert(&handler->caps, new_cap)) {
-        pthread_mutex_unlock(&handler->cap_lck);
+        pthread_rwlock_unlock(&handler->cap_lck);
         pthread_mutex_unlock(&cap_lck);
         logmsg(ERROR, "Handler %lu: Failed to allocate list elem.",
                handler->tid);
@@ -480,7 +546,7 @@ static int handle_regcap(struct handler *handler, unsigned char *id_buf) {
 
     if (slist_insert(&par_cap->rev_dom->caps, new_cap)) {
         handler->caps = slist_remove(handler->caps, new_cap);
-        pthread_mutex_unlock(&handler->cap_lck);
+        pthread_rwlock_unlock(&handler->cap_lck);
         pthread_mutex_unlock(&cap_lck);
         logmsg(ERROR, "Handler %lu: Failed to allocate list elem.",
                handler->tid);
@@ -489,7 +555,7 @@ static int handle_regcap(struct handler *handler, unsigned char *id_buf) {
         return(R_FAILURE);
     }
 
-    pthread_mutex_unlock(&handler->cap_lck);
+    pthread_rwlock_unlock(&handler->cap_lck);
     pthread_mutex_unlock(&cap_lck);
 
     return(R_SUCCESS);
@@ -529,14 +595,14 @@ static int handle_rmdom(struct handler *handler, uint32_t rdom_id) {
     }
 
     /* check if this handler has a cap with the specified rdom              */
-    pthread_mutex_lock(&handler->cap_lck);
+    pthread_rwlock_rdlock(&handler->cap_lck);
     for (lptr2 = handler->caps; lptr2 != NULL; lptr2 = lptr2->next) {
         struct crdss_srv_cap *scap = (struct crdss_srv_cap *) lptr2->data;
 
         if (scap->rev_dom->dom_key == rdom_id) 
             break;
     }
-    pthread_mutex_unlock(&handler->cap_lck);
+    pthread_rwlock_unlock(&handler->cap_lck);
 
     if (lptr == NULL || lptr2 == NULL) {
         pthread_mutex_unlock(&cap_lck);
@@ -685,21 +751,39 @@ static int handle_read(struct handler *handler, uint16_t didx, uint32_t sidx,
            "len = %u.", didx, sidx, addr, len);
 
     /* check whether access is allowed */
-    pthread_mutex_lock(&handler->cap_lck);
+    pthread_rwlock_rdlock(&handler->cap_lck);
 
     for (lptr = handler->caps; lptr != NULL;) {
         struct crdss_srv_cap *cap = (struct crdss_srv_cap *) lptr->data;
 
         pthread_mutex_lock(&cap->valid_lck);
         if (cap->valid == 0) {
-            /* capability became void, destroy it */
-            logmsg(DEBUG, "Handler %lu: Removing expired capability.");
+            /* cap became void, destruction is not scheduled; destroy it    */
+            cap->valid = -1;
             pthread_mutex_unlock(&cap->valid_lck);
+            pthread_rwlock_unlock(&handler->cap_lck);
+
+            logmsg(DEBUG, "Handler %lu: Removing expired capability.");
+            pthread_rwlock_wrlock(&handler->cap_lck);
             pthread_mutex_destroy(&cap->valid_lck);
             free(cap);
 
-            lptr = lptr->next;
+            /* restart iteration since other threads may have already       *
+             * deleted the successor of cap                                 */
+            lptr = handler->caps;
             handler->caps = slist_remove(handler->caps, cap);
+
+            /* return writer's lock and take reader's lock again (perf.)    */
+            pthread_rwlock_unlock(&handler->cap_lck);
+            pthread_rwlock_rdlock(&handler->cap_lck);
+
+            continue;
+        }
+
+        if (cap->valid < 0) {
+            /* cap is invalid and scheduled for removal, simply continue    */
+            pthread_mutex_unlock(&cap->valid_lck);
+            lptr = lptr->next;
             continue;
         }
         pthread_mutex_unlock(&cap->valid_lck);
@@ -719,7 +803,7 @@ static int handle_read(struct handler *handler, uint16_t didx, uint32_t sidx,
         lptr = lptr->next;
     }
 
-    pthread_mutex_unlock(&handler->cap_lck);
+    pthread_rwlock_unlock(&handler->cap_lck);
 
     if (lptr == NULL) {
         /* No suitable capability was found */
@@ -793,21 +877,39 @@ static int handle_write(struct handler *handler, uint16_t didx, uint32_t sidx,
     }
 
     /* check whether access is allowed */
-    pthread_mutex_lock(&handler->cap_lck);
+    pthread_rwlock_rdlock(&handler->cap_lck);
 
     for (lptr = handler->caps; lptr != NULL;) {
         struct crdss_srv_cap *cap = (struct crdss_srv_cap *) lptr->data;
 
         pthread_mutex_lock(&cap->valid_lck);
         if (cap->valid == 0) {
-            /* capability became void, destroy it */
-            logmsg(DEBUG, "Handler %lu: Removing expired capability.");
+            /* cap became void, destruction is not scheduled; destroy it    */
+            cap->valid = -1;
             pthread_mutex_unlock(&cap->valid_lck);
+            pthread_rwlock_unlock(&handler->cap_lck);
+
+            logmsg(DEBUG, "Handler %lu: Removing expired capability.");
+            pthread_rwlock_wrlock(&handler->cap_lck);
             pthread_mutex_destroy(&cap->valid_lck);
             free(cap);
 
-            lptr = lptr->next;
+            /* restart iteration since other threads may have already       *
+             * deleted the successor of cap                                 */
+            lptr = handler->caps;
             handler->caps = slist_remove(handler->caps, cap);
+
+            /* return writer's lock and take reader's lock again (perf.)    */
+            pthread_rwlock_unlock(&handler->cap_lck);
+            pthread_rwlock_rdlock(&handler->cap_lck);
+
+            continue;
+        }
+
+        if (cap->valid < 0) {
+            /* cap is invalid and scheduled for removal, simply continue    */
+            pthread_mutex_unlock(&cap->valid_lck);
+            lptr = lptr->next;
             continue;
         }
         pthread_mutex_unlock(&cap->valid_lck);
@@ -823,7 +925,7 @@ static int handle_write(struct handler *handler, uint16_t didx, uint32_t sidx,
         lptr = lptr->next;
     }
 
-    pthread_mutex_unlock(&handler->cap_lck);
+    pthread_rwlock_unlock(&handler->cap_lck);
 
     if (lptr == NULL) {
         /* No suitable capability was found */
@@ -995,9 +1097,9 @@ static int handle_drvcap2(struct handler *handler, unsigned char *par_id,
     }
 
     /* insert new capability in local cap list of handler                   */
-    pthread_mutex_lock(&handler->cap_lck);
+    pthread_rwlock_rdlock(&handler->cap_lck);
     if (slist_insert(&handler->caps, new_cap_cpy)) {
-        pthread_mutex_unlock(&handler->cap_lck);
+        pthread_rwlock_unlock(&handler->cap_lck);
         
         slist_insert(&free_dom_ids, (void *) (uint64_t) new_cap->rev_dom);
         par_cap->rev_dom->children = slist_remove(par_cap->rev_dom->children, 
@@ -1018,7 +1120,7 @@ static int handle_drvcap2(struct handler *handler, unsigned char *par_id,
         return(R_FAILURE);
     }
 
-    pthread_mutex_unlock(&handler->cap_lck);
+    pthread_rwlock_unlock(&handler->cap_lck);
     pthread_mutex_unlock(&cap_lck);
 
     *ncap = new_cap;
@@ -1244,9 +1346,9 @@ static void handle_capmgr(struct handler *handler) {
                 }
 
                 /* insert new capability in local cap list of handler       */
-                pthread_mutex_lock(&handler->cap_lck);
+                pthread_rwlock_rdlock(&handler->cap_lck);
                 if (slist_insert(&handler->caps, new_cap_cpy)) {
-                    pthread_mutex_unlock(&handler->cap_lck);
+                    pthread_rwlock_unlock(&handler->cap_lck);
                     slist_insert(&free_dom_ids, 
                         (void *) (uint64_t) new_cap->rev_dom);
                     cap_list = slist_remove(cap_list, new_cap);
@@ -1262,7 +1364,7 @@ static void handle_capmgr(struct handler *handler) {
                     continue;
                 }
 
-                pthread_mutex_unlock(&handler->cap_lck);
+                pthread_rwlock_unlock(&handler->cap_lck);
                 pthread_mutex_unlock(&cap_lck);
 
                 logmsg(DEBUG, "Handler %lu: registered new cap %p.", 
@@ -1364,7 +1466,7 @@ static void handle_capmgr(struct handler *handler) {
                  * list, destroys the rdoms and renders handler's local     *
                  * copies of caps invalid                                   */
                 if (recv(handler->sock, &rdom_id,  sizeof(uint32_t), 
-                    MSG_WAITALL) < 2) {
+                    MSG_WAITALL) < 4) {
                     logmsg(ERROR, "Failed to read rdom id as requested.");
                     return;
                 }
@@ -1401,6 +1503,37 @@ static void handle_capmgr(struct handler *handler) {
 
                 /* finally send a status answer to the client */
                 send(handler->sock, &op_res, 1, 0);
+
+                break;
+            case MTYPE_VSLCINFO:
+                if (recv(handler->sock, &device_idx,  2, MSG_WAITALL) < 2) {
+                    logmsg(ERROR, "Failed to read dev index as requested.");
+                    return;
+                }
+                if (recv(handler->sock, &slice_idx,  4, MSG_WAITALL) < 4) {
+                    logmsg(ERROR, "Failed to read slice index as requested.");
+                    return;
+                }
+
+                device_idx = ntohs(device_idx);
+                slice_idx  = ntohl(slice_idx);
+
+                /* reuse saddr as variable for storing the vslice's size    */
+                if (get_vslc_size(device_idx, slice_idx, &saddr) != 0) {
+                    op_res = R_FAILURE;
+                    send(handler->sock, &op_res, 1, 0);
+                    break;
+                }
+
+                logmsg(DEBUG, "Handler %lu: Reporting vslice (didx %u, "
+                       "sidx %u) with a size of %lu bytes.", handler->tid,
+                       device_idx, slice_idx, saddr);
+
+                saddr  = htobe64(saddr);
+                op_res = R_SUCCESS;
+
+                send(handler->sock, &op_res, 1, 0);
+                send(handler->sock, &saddr, 8, 0);
 
                 break;
             default:
@@ -2375,21 +2508,23 @@ static void *handle_client(void *args) {
 
 end:
     logmsg(INFO, "Handler %lu: Starting teardown operatons.", this->tid);
+    
+    close_ib_conn(this);
+    close(this->sock);
+    logmsg(DEBUG, "Handler %lu: Connections (IB and TCP) closed.", this->tid);
+    
     /* tear down structures and set this thread on the joinable thread list */
     /* delete local references to capabilities, note that global caps still *
      * exist, so clients may register with them!                            */
-    pthread_mutex_lock(&this->cap_lck);
+    pthread_rwlock_wrlock(&this->cap_lck);
     while (this->caps != NULL) {
         free(this->caps->data);
         this->caps = slist_remove(this->caps, this->caps->data);
     }
-    pthread_mutex_unlock(&this->cap_lck);
+    pthread_rwlock_unlock(&this->cap_lck);
+    pthread_rwlock_destroy(&this->cap_lck);
 
-    logmsg(DEBUG, "Handler %lu: Deleted caps, closing IB conn.", this->tid);
-    close_ib_conn(this);
-
-    close(this->sock);
-
+    logmsg(DEBUG, "Handler %lu: Deleted caps.", this->tid);
     logmsg(INFO, "Handler %lu: Teardown completed.", this->tid);
 
     /* set this thread on the joinable list */
@@ -2452,7 +2587,7 @@ static void *entry_listener(void *args) {
         new_handler->msg_buf  = NULL;
         new_handler->data_buf = NULL;
 
-        if (pthread_mutex_init(&new_handler->cap_lck, NULL) != 0) {
+        if (pthread_rwlock_init(&new_handler->cap_lck, NULL) != 0) {
             logmsg(ERROR, "Failed to init capability lock for new handler (%d)",
                    errno);
             free(new_handler);

@@ -15,11 +15,16 @@
  ****************************************************************************/
 
 
+#define _GNU_SOURCE
+
 /* worker ID for threads above the no_worker limit of the buffer config     */
 #define WORKER_UNREG UINT16_MAX
 
 /* size of a single cache line in Bytes (== size for doorbell fields)       */
 #define CL_SIZE 64
+
+/* maximum file descriptor that can be used for CRDSS files                 */
+#define LIBCRDSS_MAX_FD 64
 
 /****************************************************************************
  *                                                                          *
@@ -30,14 +35,19 @@
 
 #include <stdio.h>                          /* std. I/O channels            */
 #include <string.h>                         /* string manipulation          */
+#include <stdarg.h>                         /* for varargs in open64        */
 #include <sys/socket.h>                     /* networking API               */
 #include <sys/un.h>                         /* UNIX domain sockets          */
 #include <sys/stat.h>                       /* check socket files           */
+#include <sys/types.h>                      /* as required for open(2)      */
+#include <fcntl.h>                          /* get access to the open func. */
 #include <unistd.h>                         /* standard UNIX calls          */
 #include <sys/syscall.h>                    /* for calling gettid           */
+#include <dlfcn.h>                          /* for playing with symbols...  */
 
 #include "include/libcrdss.h"               /* header for libcrdss impl.    */
 #include "include/protocol.h"               /* CRDSS protocol               */
+#include "include/utils.h"                  /* CRDSS logging facility       */
 
 /****************************************************************************   
  *                                                                          *   
@@ -63,6 +73,14 @@ struct wctx {
     struct crdss_srv_ctx *sctx;         /* pointer to associated server ctx */
 };
 
+/* structure for emulating POSIX files                                      */
+struct crdss_posix_file {
+    struct crdss_srv_ctx *sctx;         /* server connection for this file  */
+    struct crdss_clt_cap cap;           /* cap for file access              */
+
+    unsigned long int file_ptr;         /* position in file for read/write  */
+};
+
 /****************************************************************************   
  *                                                                          *   
  *                           global variables                               *   
@@ -77,12 +95,37 @@ static struct sockaddr_un capmgr_addr; /* domain socket addr of cap manager */
 /* lock for serializing access (preliminary limitation)                     */
 static pthread_mutex_t capmgr_lck = PTHREAD_MUTEX_INITIALIZER;
 
+/* indicates whether logger is initialized                                  */
+static pthread_once_t log_init = PTHREAD_ONCE_INIT;
+
+/* array for file contexts                                                  */
+static struct crdss_posix_file *fd_table[LIBCRDSS_MAX_FD];
+
+/* pointers to functions defined by libc but partially shadowed by the POSIX*
+ * emulation of libcrdss.                                                   */
+static ssize_t (*libc_pread64)(int, void *, size_t, off_t)        = NULL;
+static ssize_t (*libc_pwrite64)(int, const void *, size_t, off_t) = NULL;
+static int (*libc_xstat64)(int, const char *, struct stat64 *)    = NULL;
+static int (*libc_lxstat64)(int, const char *, struct stat64 *)   = NULL;
+static int (*libc_open64)(const char *, int, ...)                 = NULL;
+
 /****************************************************************************
  *                                                                          *
  *                          static helper functions                         *
  *                                                                          *
  ****************************************************************************/
 
+
+/****************************************************************************
+ *
+ * Initializes the logging facility of libcrdss. This function is expected
+ * to be called through pthread_once during library initialization. It uses
+ * stderr as default output. The loglevel displayed can be adjusted by 
+ * changing the parameters of init_logger.
+ */
+static void setup_logger(void) {
+    init_logger("/dev/stderr", DEBUG);
+}
 
 /****************************************************************************
  *
@@ -185,7 +228,7 @@ static struct wctx *get_wctx(struct crdss_srv_ctx *sctx) {
         return(NULL);
     }
 
-    printf("New worker id is: %u.\n", ctx->wid);
+    logmsg(DEBUG, "New worker id is: %u.", ctx->wid);
     return(ctx);
 
 err_cv:
@@ -218,18 +261,18 @@ static void *completion_worker(void *ctx) {
 
     while (1) {
         ret = get_next_ibmsg(&sctx->ibctx, &msg, &imm);
-        printf("comp worker: got new message (imm = %u)!\n", imm);
+        logmsg(DEBUG, "comp worker: got new message (imm = %u)!", imm);
 
         pthread_mutex_lock(&sctx->wait_lck);
-        printf("comp worker: trying %u wait entries.\n", 
+        logmsg(DEBUG, "comp worker: trying %u wait entries.", 
                slist_length(sctx->wait_workers));
 
         /* try to find worker that wait for imm                             */
         for (lptr = sctx->wait_workers; lptr != NULL; lptr = lptr->next) {
             struct wctx *wcontext = (struct wctx *) lptr->data;
 
-            printf("comp worker: trying entry %p.\n", (void *) wcontext);
-            printf("comp worker: next key of worker is %u.\n", 
+            logmsg(DEBUG, "comp worker: trying entry %p.", (void *) wcontext);
+            logmsg(DEBUG, "comp worker: next key of worker is %u.", 
                    wcontext->next_key);
             if (imm == wcontext->next_key) {
                 wcontext->status = ret;
@@ -299,13 +342,13 @@ static int wait_for_ibmsg(struct wctx *wcontext, uint32_t key) {
 
     pthread_mutex_lock(&wcontext->sctx->wait_lck);
 
-    printf("wfibmsg: searching unknown list.\n");
+    logmsg(DEBUG, "wfibmsg: searching unknown list.");
     for (lptr = wcontext->sctx->unknown_compl; lptr != NULL; lptr = lptr->next){
         struct wctx *unknown = (struct wctx *) lptr->data;
     
         /* check if a completion occured meanwhile calling this function    */
         if (unknown->next_key == key) {
-            printf("wfibmsg: matching unknown entry found.\n");
+            logmsg(DEBUG, "wfibmsg: matching unknown entry found.");
             wcontext->sctx->unknown_compl = 
                 slist_remove(wcontext->sctx->unknown_compl, unknown);
 
@@ -319,7 +362,7 @@ static int wait_for_ibmsg(struct wctx *wcontext, uint32_t key) {
         }
     }
 
-    printf("wfibmsg: inserting thread in wait list (key = %u ptr = %p).\n", 
+    logmsg(DEBUG, "wfibmsg: inserting thread in wait list (key = %u ptr = %p).", 
            wcontext->next_key, (void *) wcontext);
     if (slist_insert(&wcontext->sctx->wait_workers, wcontext) != 0) {
         pthread_mutex_unlock(&wcontext->sctx->wait_lck);
@@ -351,6 +394,8 @@ struct crdss_srv_ctx *create_srv_ctx(struct clt_lib_cfg *cfg) {
     struct crdss_srv_ctx *ctx = NULL;           /* newly allocated context  */
     size_t id_bm_size;                          /* size of ID bitmap (in B) */
 
+    pthread_once(&log_init, &setup_logger);
+
     if ((ctx = calloc(1, sizeof(struct crdss_srv_ctx))) == NULL) {
         /* allocation of context structure failed. */
         return(NULL);
@@ -373,11 +418,11 @@ struct crdss_srv_ctx *create_srv_ctx(struct clt_lib_cfg *cfg) {
     /* set the server connection's InfiniBand buffer settings               */
     if (cfg == NULL || check_libcfg(cfg) != 0) {
         /* no (or bad) config given, try to load it from def. location      */
-        fprintf(stderr, "No config passed. Trying default config file %s.\n",
-                DEF_LIB_CFG_PATH);
+        logmsg(INFO, "No config passed. Trying default config file %s.",
+               DEF_LIB_CFG_PATH);
 
         if (parse_lib_config(DEF_LIB_CFG_PATH, &ctx->buf_cfg) != 0) {
-            fprintf(stderr, "Failed to parse configuration file.\n");
+            logmsg(SEVERE, "Failed to parse configuration file.");
             goto lock_err;
         }
     }
@@ -388,7 +433,7 @@ struct crdss_srv_ctx *create_srv_ctx(struct clt_lib_cfg *cfg) {
     /* create TLS key for worker context of the new server connection       */
     if (pthread_key_create(&ctx->tls_key, &wctx_destructor) != 0) {
         /* failed to allocate new TLS key */
-        fprintf(stderr, "Failed to allcoate new TLS key.\n");
+        logmsg(SEVERE, "Failed to allcoate new TLS key.");
         goto lock_err;
     }
     
@@ -397,7 +442,7 @@ struct crdss_srv_ctx *create_srv_ctx(struct clt_lib_cfg *cfg) {
                  ? ctx->buf_cfg.no_workers 
                  : ctx->buf_cfg.no_workers + 1;
     if ((ctx->worker_ids = calloc(1, id_bm_size)) == NULL) {
-        fprintf(stderr, "Failed to allocate worker ID bitmap.\n");
+        logmsg(SEVERE, "Failed to allocate worker ID bitmap.");
         goto lock_err;
     }
 
@@ -551,7 +596,7 @@ int request_new_cap(struct crdss_clt_cap *cap) {
     /* send message to cap manager */
     sendto(capmgr_fd, msg_buf, MAX_MSG_LEN, 0, (struct sockaddr *) &capmgr_addr,
            (socklen_t) sizeof(capmgr_addr));
-    printf("lib: cap data sent.\n");
+    logmsg(DEBUG, "lib: cap data sent.");
 
     /* reset msg buffer to avoid reading stale data */
     memset(msg_buf, 0, MAX_MSG_LEN);
@@ -575,7 +620,7 @@ int request_new_cap(struct crdss_clt_cap *cap) {
     memcpy(&cap->rev_dom, msg_buf + CAP_ID_LEN + 1, sizeof(uint32_t));
     memcpy(&cap->srv.sin_port, msg_buf + CAP_ID_LEN + 5, 
            sizeof(unsigned short));
-    printf("server port for cap is %u.\n", ntohs(cap->srv.sin_port));
+    logmsg(DEBUG, "server port for cap is %u.", ntohs(cap->srv.sin_port));
 
     return(0);
 }
@@ -607,14 +652,14 @@ int init_ib_comm(struct crdss_srv_ctx *sctx) {
     /* abort initialization if the IB connection has been setup previously  */
     if (sctx-> msg_buf != NULL || sctx->rdma_buf != NULL) {
         pthread_mutex_unlock(&sctx->tcp_lck);
-        fprintf(stderr, "IB connection was already set up.\n");
+        logmsg(ERROR, "IB connection was already set up.");
         return(1);
     }
 
     /* abort initialization if server context has no TCP connection         */
     if (sctx->tcp_fd == -1) {
         pthread_mutex_unlock(&sctx->tcp_lck);
-        fprintf(stderr, "Context is not connected to a storage server.\n");
+        logmsg(ERROR, "Context is not connected to a storage server.");
         return(1);
     }
 
@@ -636,7 +681,7 @@ int init_ib_comm(struct crdss_srv_ctx *sctx) {
                     &sctx->rdma_buf, rdma_size) != 0) {
         /* IB queue pair initialization failed */
         pthread_mutex_unlock(&sctx->tcp_lck);
-        printf("IB queue pair initialization failed\n");
+        logmsg(ERROR, "IB queue pair initialization failed.");
         return(1);
     }
 
@@ -653,7 +698,7 @@ int init_ib_comm(struct crdss_srv_ctx *sctx) {
         send(sctx->tcp_fd, &worker_cnt, 2, 0) < 2) {
         /* failed to transmit IB connection data to server */
         pthread_mutex_unlock(&sctx->tcp_lck);
-        printf("Failed to transmit IB connection data to server.\n");
+        logmsg(ERROR, "Failed to transmit IB connection data to server.");
         return(1);
     }
 
@@ -701,7 +746,7 @@ int init_ib_comm(struct crdss_srv_ctx *sctx) {
 
     for (i = 0; i < sctx->buf_cfg.lbuf_cnt; i++) {
         if (slist_insert(&sctx->avail_lbuf, lbuf_offs) != 0) {
-            fprintf(stderr, "Failed to allocate memory for free lbuf list.\n");
+            logmsg(ERROR, "Failed to allocate memory for free lbuf list.");
             pthread_mutex_unlock(&sctx->lbuf_lck);
             pthread_mutex_unlock(&sctx->tcp_lck);
             return(1);
@@ -980,6 +1025,49 @@ int query_srv_block(struct crdss_srv_ctx *sctx) {
     return(op_res);
 }
 
+/* Queries the size of the vslice in ccap from the capability manager.      */
+int get_vslice_size(struct crdss_clt_cap *ccap, uint64_t *size) {
+    size_t addr_sz;                     /* size of server address           */
+
+    unsigned char msg_buf[MAX_MSG_LEN]; /* message buffer sent to capmgr    */
+
+    /* query size of vslice */
+    addr_sz = sizeof(ccap->srv.sin_addr.s_addr);
+    memset(msg_buf, 0, MAX_MSG_LEN);
+    msg_buf[0] = MTYPE_VSLCINFO;
+    memcpy(msg_buf + 1, &ccap->srv.sin_addr.s_addr, addr_sz);
+    memcpy(msg_buf + 1 + addr_sz, &ccap->dev_idx, 2);
+    memcpy(msg_buf + 3 + addr_sz, &ccap->vslc_idx, 4);
+
+    /* grab the capmgr lock to ensure that the received answer belongs to   *
+     * the request that was just sent                                       */
+    pthread_mutex_lock(&capmgr_lck);
+
+    /* send message to cap manager */
+    sendto(capmgr_fd, msg_buf, MAX_MSG_LEN, 0, (struct sockaddr *) &capmgr_addr,
+           (socklen_t) sizeof(capmgr_addr));
+
+    /* reset msg buffer to avoid reading stale data */
+    memset(msg_buf, 0, MAX_MSG_LEN);
+
+    /* wait for answer from cap manager (he is the only one that should send *
+     * mssages, so we do not care for the sender's address here (TODO))      */
+    if (recv(capmgr_fd, msg_buf, MAX_MSG_LEN, 0) < 1) {
+        /* read from capmgr failed */
+        pthread_mutex_unlock(&capmgr_lck);
+        return(R_FAILURE);
+    }
+
+    pthread_mutex_unlock(&capmgr_lck);
+
+    if (msg_buf[0] != R_SUCCESS) {
+        return(R_FAILURE);
+    }
+
+    memcpy(size, msg_buf + 1, sizeof(uint64_t));
+    return(R_SUCCESS);
+}
+
 /* Reads len bytes from the storage location specified.                     */
 int fast_read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
                   uint64_t saddr, void *buf, uint32_t len) {
@@ -1042,17 +1130,16 @@ int fast_read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         /* prepare poll field */
         *pf_ptr = R_UNDEF;
 
-        printf("fast_read_raw: sending request to server.\n");
+        logmsg(DEBUG, "fast_read_raw: sending request to server.");
         if (post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid) != 0) {
             /* failed to post send request */
             return(R_FAILURE);
         }
 
         /* spin in this loop until the result arrived */
-        printf("fast_read_raw: spinning on addr %p.\n", (void *) pf_ptr);
+        logmsg(DEBUG, "fast_read_raw: spinning on addr %p.", (void *) pf_ptr);
         while (*pf_ptr == R_UNDEF) 
             ;
-            /* printf("fast_read_raw: value of doorbell is %#x\n", *pf_ptr); */
 
         if (*pf_ptr != R_SUCCESS)
             return(*pf_ptr);
@@ -1070,7 +1157,7 @@ int fast_read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
 
 /* Writes len bytes to the storage location specified                       */
 int fast_write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
-                   uint64_t saddr, void *buf, uint32_t len) {
+                   uint64_t saddr, const void *buf, uint32_t len) {
     uint16_t didx_nw;               /* parameters in network byte order     */
     uint32_t sidx_nw;
     uint64_t saddr_nw;
@@ -1229,7 +1316,7 @@ int read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
             return(R_FAILURE);
         }
 
-        printf("read_raw: Waiting for answer of server.\n");
+        logmsg(DEBUG, "read_raw: Waiting for answer of server.");
         /* wait for answer of server */        
         if (wait_for_ibmsg(work_ctx, work_ctx->tid) != 0) {
             /* receive op failed */
@@ -1237,7 +1324,7 @@ int read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         }
 
         op_res = (work_ctx->status == IBV_WC_SUCCESS) ? R_SUCCESS : R_FAILURE;
-        printf("read_raw: server status is %u.\n", op_res);
+        logmsg(DEBUG, "read_raw: server status is %u.", op_res);
         /* repost receive request */
         if (post_msg_rr(&sctx->ibctx, work_ctx->msg, 1) != 0) {
             op_res = R_FAILURE;
@@ -1271,7 +1358,7 @@ int read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
 
 /* Writes len bytes to the storage location specified (blocking compl.).    */
 int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
-              uint64_t saddr, void *buf, uint32_t len) {
+              uint64_t saddr, const void *buf, uint32_t len) {
     uint8_t  op_res = R_FAILURE;    /* result of server operation           */
 
     uint16_t didx_nw;               /* parameters in network byte order     */
@@ -1348,7 +1435,7 @@ int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
             /* receive op failed */
             return(1);
         }
-        printf("write_raw: data transfer complete, sending msg.\n");
+        logmsg(DEBUG, "write_raw: data transfer complete, sending msg.");
 
         op_res = (work_ctx->status == IBV_WC_SUCCESS) ? R_SUCCESS : R_FAILURE;
         /* repost receive request */
@@ -1379,7 +1466,7 @@ int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
             break;
         }
 
-        printf("write_raw: got answer from server (%u).\n", op_res);
+        logmsg(DEBUG, "write_raw: got answer from server (%u).", op_res);
 
         if (op_res != R_SUCCESS)
             break;
@@ -1402,4 +1489,358 @@ int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
     pthread_mutex_unlock(&sctx->lbuf_lck);
     
     return(op_res);
+}
+
+/***                     POSIX interface emulation                        ***/
+
+/* Reads up to count bytes from file descriptor fd at offset offset.        */
+ssize_t pread64(int fd, void *buf, size_t count, off_t offset) {
+    int ret = 0;                    /* return value of calls to read        */
+
+    /* the conversion is necessary since ISO C does not support conversion  *
+     * of void * to function pointers                                       */
+    if (libc_pread64 == NULL)
+        libc_pread64 = dlsym(RTLD_NEXT, "pread64");
+
+    printf("Called pread64!\n");
+    
+    if (fd_table[fd] == NULL)
+        return(libc_pread64(fd, buf, count, offset));
+
+    /* else: use crdss functions for reading data */
+    if (count <= fd_table[fd]->sctx->buf_cfg.sbuf_size && 
+        get_wctx(fd_table[fd]->sctx) != NULL) {
+        /* use small buffers for data transmission */
+        ret = fast_read_raw(fd_table[fd]->sctx, fd_table[fd]->cap.dev_idx,
+                            fd_table[fd]->cap.vslc_idx, (uint64_t) offset, buf,
+                            count);
+
+        if (ret != 0) {
+            errno = EIO;
+            return(-1);
+        }
+        else {
+            return(count);
+        }
+    }
+
+    /* use large buffers for data transmission */
+    ret = read_raw(fd_table[fd]->sctx, fd_table[fd]->cap.dev_idx,
+                   fd_table[fd]->cap.vslc_idx, (uint64_t) offset, buf,
+                   count);
+
+    if (ret != 0) {
+        errno = EIO;
+        return(-1);
+    }
+    else {
+        return(count);
+    }
+}
+
+/* wrapper for pwrite64 of libc                                             */
+ssize_t pwrite64(int fd, const void *buf, size_t nbyte, off_t offset) {
+    int ret = 0;                    /* return values of calls to write      */
+
+    if (libc_pwrite64 == NULL)
+        libc_pwrite64 = dlsym(RTLD_NEXT, "pwrite64");
+
+    printf("Called pwrite64!\n");
+    
+    if (fd_table[fd] == NULL)
+        return(libc_pwrite64(fd, buf, nbyte, offset));
+
+    /* else: use crdss functions for reading data */
+    if (nbyte <= fd_table[fd]->sctx->buf_cfg.sbuf_size && 
+        get_wctx(fd_table[fd]->sctx) != NULL) {
+        /* use small buffers for data transmission */
+        ret = fast_write_raw(fd_table[fd]->sctx, fd_table[fd]->cap.dev_idx,
+                             fd_table[fd]->cap.vslc_idx, (uint64_t) offset, buf,
+                             nbyte);
+
+        if (ret != 0) {
+            errno = EIO;
+            return(-1);
+        }
+        else {
+            return(nbyte);
+        }
+    }
+
+    /* use large buffers for data transmission */
+    ret = write_raw(fd_table[fd]->sctx, fd_table[fd]->cap.dev_idx,
+                    fd_table[fd]->cap.vslc_idx, (uint64_t) offset, buf,
+                    nbyte);
+
+    if (ret != 0) {
+        errno = EIO;
+        return(-1);
+    }
+    else {
+        return(nbyte);
+    }
+}
+
+/* Linux wrapper for stat system calls                                      */
+int __xstat64(int ver, const char *path, struct stat64 * stat_buf) {
+    struct crdss_clt_cap ccap;
+
+    uint64_t vslc_size = 0;
+
+    char *basename = NULL;              /* basename of path                 */
+    char *last_sep = NULL;              /* last occurence of '/' in path    */
+
+    if (libc_xstat64 == NULL)
+        libc_xstat64 = dlsym(RTLD_NEXT, "__xstat64");
+
+    /* printf("Called __xstat64!\n"); */
+
+    /* compute basename */
+    last_sep = strrchr(path, '/');
+    if (last_sep == NULL)
+        basename = strdup(path);
+    else
+        basename = strdup(last_sep + 1);
+
+    if (strncmp(basename, "crdss", 5) != 0)
+        return(libc_xstat64(ver, path, stat_buf));
+    
+    printf("Entering custom part of __xstat64!\n");
+    /* else: provide custom values for the crdss file */
+    memset(stat_buf, 0, sizeof(struct stat64));
+ 
+    /* try to derive basic information about requested device from path     */
+    if (init_ccap_from_path(basename, &ccap) != 0) {
+        printf("error while parsing cap.\n");
+        return(-1);
+    }
+    
+    printf("derived cap from file name. didx = %u, sidx = %u\n", 
+          ccap.dev_idx, ccap.vslc_idx);
+
+    /* if not done yet, connect to capability manager */
+    if (capmgr_fd == -1 && connect_capmgr_dom(DEF_CAPMGR_SOCK) != 0)
+        return(-1);
+
+    printf("Getting vslice size...\n");
+    /* query size of vslice */
+    if (get_vslice_size(&ccap, &vslc_size) != R_SUCCESS) 
+        return(-1);
+
+    printf("vslice size is %lu\n", vslc_size);
+    stat_buf->st_size  = vslc_size;
+
+    stat_buf->st_mode  = S_IFREG;           /* disguise as regular file     */
+    stat_buf->st_mode |= S_IRUSR;
+    stat_buf->st_mode |= S_IWUSR;
+
+    stat_buf->st_uid = getuid();
+    stat_buf->st_gid = getgid();
+
+    free(basename);
+    return(0);
+}
+
+/* Linux wrapper for stat system calls                                      */
+int __lxstat64(int ver, const char *path, struct stat64 * stat_buf) {
+    struct crdss_clt_cap ccap;
+
+    uint64_t vslc_size = 0;
+
+    char *basename = NULL;              /* basename of path                 */
+    char *last_sep = NULL;              /* last occurence of '/' in path    */
+
+    if (libc_lxstat64 == NULL)
+        libc_lxstat64 = dlsym(RTLD_NEXT, "__lxstat64");
+
+    printf("Called __lxstat64!\n");
+
+    /* compute basename */
+    last_sep = strrchr(path, '/');
+    if (last_sep == NULL)
+        basename = strdup(path);
+    else
+        basename = strdup(last_sep + 1);
+
+    if (strncmp(basename, "crdss", 5) != 0)
+        return(libc_lxstat64(ver, path, stat_buf));
+    
+    printf("Entering custom part of __lxstat64!\n");
+    /* else: provide custom values for the crdss file */
+    memset(stat_buf, 0, sizeof(struct stat64));
+ 
+    /* try to derive basic information about requested device from path     */
+    if (init_ccap_from_path(basename, &ccap) != 0) {
+        printf("error while parsing cap.\n");
+        return(-1);
+    }
+    
+    printf("derived cap from file name. didx = %u, sidx = %u\n", 
+          ccap.dev_idx, ccap.vslc_idx);
+
+    /* if not done yet, connect to capability manager */
+    if (capmgr_fd == -1 && connect_capmgr_dom(DEF_CAPMGR_SOCK) != 0)
+        return(-1);
+
+    printf("Getting vslice size...\n");
+    /* query size of vslice */
+    if (get_vslice_size(&ccap, &vslc_size) != R_SUCCESS) 
+        return(-1);
+
+    printf("vslice size is %lu\n", vslc_size);
+    stat_buf->st_size  = vslc_size;
+
+    stat_buf->st_mode  = S_IFREG;           /* disguise as regular file     */
+    stat_buf->st_mode |= S_IRUSR;
+    stat_buf->st_mode |= S_IWUSR;
+
+    stat_buf->st_uid = getuid();
+    stat_buf->st_gid = getgid();
+
+    free(basename);
+    return(0);
+}
+
+/* System call wrapper for open.                                            */
+int open64(const char *pathname, int flags, ...) {
+    char *basename = NULL;              /* basename of path                 */
+    char *last_sep = NULL;              /* last occurence of '/' in path    */
+
+    struct crdss_posix_file *pfile = NULL;
+    int os_fd;                          /* fd returned from OS              */
+    uint64_t slice_size = 0;            /* size of opened vslice            */
+
+    if (libc_open64 == NULL)
+        libc_open64 = dlsym(RTLD_NEXT, "open64");
+
+    printf("Called open64!\n");
+
+    /* compute basename */
+    last_sep = strrchr(pathname, '/');
+    if (last_sep == NULL)
+        basename = strdup(pathname);
+    else
+        basename = strdup(last_sep + 1);
+
+    if (strncmp(basename, "crdss", 5) != 0) {
+        int ret = -1;                               /* rc of real open64    */
+        va_list arglist;
+    
+        va_start(arglist, flags);
+        ret = libc_open64(pathname, flags, arglist);
+        va_end(arglist);
+        return(ret);
+    }
+
+    printf("Entering custom part of open64!\n");
+    
+    /* if not done yet, connect to capability manager */
+    if (capmgr_fd == -1 && connect_capmgr_dom(DEF_CAPMGR_SOCK) != 0)
+        return(-1);
+
+    if ((pfile = calloc(1, sizeof(struct crdss_posix_file))) == NULL) {
+        errno = ENOMEM;
+        goto file_alloc_err;
+    }
+
+    /* try to derive basic information about requested device from path     */
+    if (init_ccap_from_path(basename, &pfile->cap) != 0) {
+        printf("error while parsing cap.\n");
+        return(-1);
+    }
+   
+    printf("derived cap from file name. didx = %u, sidx = %u\n", 
+          pfile->cap.dev_idx, pfile->cap.vslc_idx);
+
+    /* derive rights of capability from flags parameter */
+    if ((flags & O_ACCMODE) == O_RDONLY) {
+        printf("cap is rd only.\n");
+        pfile->cap.rights |= CAP_READ;
+    }
+    else if ((flags & O_ACCMODE) == O_WRONLY) {
+        printf("cap is wr only.\n");
+        pfile->cap.rights |= CAP_WRITE;
+    }
+    else if ((flags & O_ACCMODE) == O_RDWR) {
+        printf("cap is rd/wr\n");
+        pfile->cap.rights |= CAP_READ;
+        pfile->cap.rights |= CAP_WRITE;
+    }
+    else {
+        printf("error: cap without rights.\n");
+        errno = EINVAL;
+        goto rights_err;
+    }
+
+    /* get cap for full vslice */
+    if (get_vslice_size(&pfile->cap, &slice_size) != R_SUCCESS) {
+        printf("Failed to determine size of vslice.\n");
+        errno = EINVAL;
+        goto rights_err;
+    }
+    /* set cap range to whole slice, end offset of cap is slice size - 1!   */
+    pfile->cap.start_addr = 0;
+    pfile->cap.end_addr   = slice_size - 1;
+
+    /* get backing fd to /dev/null */
+    os_fd = libc_open64("/dev/null", O_WRONLY, 0);
+    if (os_fd < 0)
+        goto rights_err;
+    if (os_fd > (LIBCRDSS_MAX_FD - 1)) {
+        printf("Number of open files exceeds limit of libcrdss.\n");
+        goto fd_err;
+    }
+
+    /* set entry in fd table */
+    fd_table[os_fd] = pfile;
+
+    /* allocate a new server context for the file */
+    pfile->sctx = create_srv_ctx(NULL);
+    if (pfile->sctx == NULL) {
+        printf("Unable to allocate new server context.\n");
+        goto sctx_err;
+    }
+
+    /* request creation of capability */
+    if (request_new_cap(&pfile->cap) != 0) {
+        printf("Failed to create capability for open() request.\n");
+        errno = EPERM;
+        goto cap_err;
+    }
+
+    /* connect to storage server */
+    if (connect_storage_srv(pfile->sctx) != 0) {
+        printf("Failed to connect to storage server.\n");
+        errno = ENXIO;
+        goto cap_err;
+    }
+
+    /* register cap at server */
+    if (reg_cap(pfile->sctx, pfile->cap.id) != 0) {
+        printf("Failed to register cap at server.\n");
+        errno = EPERM;
+        goto reg_err;
+    }
+
+    /* setup IB communication for further I/O operations */
+    if (init_ib_comm(pfile->sctx) != 0) {
+        printf("Failed to setup IB communication with crdss server.\n");
+        errno = ENXIO;
+        goto reg_err;
+    }
+
+    return(os_fd);
+
+reg_err:
+    close_srv_conn(pfile->sctx);
+cap_err:
+    free(pfile->sctx);
+sctx_err:
+    fd_table[os_fd] = NULL;
+fd_err:
+    close(os_fd);
+rights_err:
+    free(pfile);
+file_alloc_err:
+    return(-1);
 }

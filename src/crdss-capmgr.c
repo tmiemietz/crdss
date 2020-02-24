@@ -267,7 +267,124 @@ void connect_servers(void) {
     }
 }
 
-/***************************************************************************
+/****************************************************************************
+ *
+ * Queries the server for the size of vslice on behlads of a client. In 
+ * order for the function to succeed, there must be at least one capability
+ * configured that grants the client access to the server/dev_idx/vslice_idx
+ * combination specified in the datagram message.
+ *
+ * Params: msg_buf  - buffer to data of received datagram.
+ *         creds    - credentials of the peer that sent this datagram.
+ *         clt_addr - address of the client that sent the request. 
+ *         addr_len - length of received client address as returned by recv etc.
+ *
+ * Returns: 0 on success, 1 on error.
+ */
+static int relay_vslcinfo(unsigned char *msg_buf, struct ucred *creds, 
+    struct sockaddr_un *clt_addr, socklen_t addr_len) {
+
+    uint16_t dev_idx       = 0;                 /* parameters received      */
+    uint32_t vslc_idx      = 0;
+    unsigned long srv_addr = 0;
+
+    struct server        *srv;                  /* server to send msg to    */
+    struct clt_req       *new_req;              /* new client request       */
+   
+    /* +1 since the first byte is the message type                          */
+    unsigned char *msg_ptr = msg_buf + 1;       /* ptr to next elem in buf  */
+
+    uint8_t opcode;                             /* msg type for server      */
+    struct slist *lptr;                         /* ptr for list iteration   */
+
+    logmsg(DEBUG, "Client UID is %u.", creds->uid);
+
+    /* read input data from client datagram */
+    memcpy(&srv_addr, msg_ptr, sizeof(unsigned long));
+    msg_ptr += sizeof(unsigned long);
+    memcpy(&dev_idx, msg_ptr, 2);
+    msg_ptr += 2;
+    memcpy(&vslc_idx, msg_ptr, 4);
+
+    /* check whether a capability as specified by the client was configured */
+    for (lptr = capmgr_cfg.caps; lptr != NULL; lptr = lptr->next) {
+        struct crdss_clt_cap *cap = (struct crdss_clt_cap *) lptr->data;
+
+        if (cap->uid != creds->uid)
+            logmsg(DEBUG, "UID not matching conf: %u, clt %u.", cap->uid, 
+                   creds->uid);
+
+        if (cap->dev_idx == dev_idx && cap->vslc_idx == vslc_idx &&
+            cap->srv.sin_addr.s_addr == srv_addr &&
+            cap->uid == creds->uid) {
+            break;
+        }
+    }
+
+    if (lptr == NULL) {
+        /* cap not found */
+        logmsg(WARN, "Cap requested by client was not configured.");
+        return(1);
+    }
+
+    pthread_mutex_lock(&srv_lck);
+    logmsg(DEBUG, "Searching server list.");
+
+    /* check whether the requested server is currently active               */
+    for (lptr = active_srvs; lptr != NULL; lptr = lptr->next) {
+        srv = (struct server *) lptr->data;
+
+        if (srv->addr.sin_addr.s_addr == srv_addr) {
+            break;
+        }
+    }
+
+    if (lptr == NULL) {
+        /* server not found */
+        pthread_mutex_unlock(&srv_lck);
+        logmsg(WARN, "Server for requested capability is not connected.");
+        return(1);
+    }
+
+    logmsg(DEBUG, "Filling intermediate request struct.");
+    if ((new_req = malloc(sizeof(struct clt_req))) == NULL) {
+        pthread_mutex_unlock(&srv_lck);
+        logmsg(WARN, "Memory allocation for new request failed.");
+        return(1);
+    }
+
+    new_req->type     = MTYPE_VSLCINFO;
+    new_req->cap      = NULL;
+    memcpy(&new_req->clt_addr, clt_addr, sizeof(struct sockaddr_un));
+    new_req->addr_len = addr_len;
+    opcode  = MTYPE_VSLCINFO;
+
+    /* convert parameters to network byte order to comm. with server */
+    dev_idx  = htons(dev_idx);
+    vslc_idx = htonl(vslc_idx);
+
+    pthread_mutex_lock(&srv->req_lck);
+
+    if (slist_append(&srv->requests, new_req) ||
+        send(srv->sock_fd, &opcode, 1, 0) < 1 ||
+        send(srv->sock_fd, &dev_idx, 2, 0) < 2 ||
+        send(srv->sock_fd, &vslc_idx, 4, 0) < 4) {
+        
+        logmsg(ERROR, "Failed to register new request.");
+        srv->requests = slist_remove(srv->requests, new_req);
+        pthread_mutex_unlock(&srv->req_lck);
+        pthread_mutex_unlock(&srv_lck);
+
+        free(new_req);
+    }
+    
+    pthread_mutex_unlock(&srv->req_lck);
+    pthread_mutex_unlock(&srv_lck);
+
+    return(0);
+}
+
+/****************************************************************************
  *
  * Checks whether the parameters inside a buffer received via a datagram 
  * socket / queue pair allow for the creation of a new capability and if
@@ -504,6 +621,7 @@ static int handle_srv_msg(int srvfd) {
 
     uint8_t op_res;                             /* server status response   */
     unsigned short srv_port = 0;                /* port of server for cap   */
+    uint64_t slice_size     = 0;                /* size of vslice           */
 
     unsigned char ans_buf[MAX_MSG_LEN];         /* buf for answer to client */
 
@@ -601,6 +719,15 @@ static int handle_srv_msg(int srvfd) {
             memcpy(ans_buf + CAP_ID_LEN + 1, &req.cap->rev_dom, 4);
             memcpy(ans_buf + CAP_ID_LEN + 5, &srv_port, sizeof(unsigned short));
 
+            break;
+        case MTYPE_VSLCINFO:
+            if (recv(srvfd, &slice_size, 8, MSG_WAITALL) < 8) {
+                logmsg(ERROR, "Failed to read server answer for VSLCINFO.");
+                return(1);
+            }
+
+            slice_size = be64toh(slice_size);
+            memcpy(ans_buf + 1, &slice_size, 8);
             break;
         default:
             logmsg(ERROR, "Unknown request type found.");
@@ -813,6 +940,34 @@ int client_listener(void) {
                 }
                 else { 
                     logmsg(DEBUG, "MKCAP2 request forwarded to server.");
+                }
+
+                break;
+            case MTYPE_VSLCINFO:
+                /* client queries size of a vslice                          */
+                if (relay_vslcinfo(msg_buf, creds, &peer_addr, 
+                    (socklen_t) hdr.msg_namelen) != 0) {
+                   
+                   logmsg(WARN, "Failed to relay VSLCINFO request.");
+                
+                   /* Notify the client */
+                   memset(msg_buf, 0, MAX_MSG_LEN);
+                   msg_buf[0] = R_FAILURE;
+                   /* important: only use as much bytes as returned in msghdr *
+                    * otherwise the socket address has a different path and   *
+                    * hence refers to a different address which is certainly  *
+                    * not a socket. In this case, sendto returns -1 with      *
+                    * errno set to 111 (connection refused)                   */
+                   ret = sendto(clt_sock, msg_buf, MAX_MSG_LEN, 0,
+                                (struct sockaddr *) &peer_addr,
+                                (socklen_t) hdr.msg_namelen); 
+                   if (ret < MAX_MSG_LEN) {
+                       logmsg(WARN, "Could not transmit error message to clt "
+                              "(returned %d, errno is %d).", ret, errno);
+                   }
+                }
+                else { 
+                    logmsg(DEBUG, "VSLCINFO request forwarded to server.");
                 }
 
                 break;

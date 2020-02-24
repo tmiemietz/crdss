@@ -59,6 +59,9 @@
 #define MTYPE_CPOLL     0x50                /* use polling completion       */
 #define MTYPE_CBLOCK    0x51                /* use blocking completion      */
 
+/* messages for partitioning operations */
+#define MTYPE_VSLCINFO  0x70                /* get info about a vslice      */
+
 /***                           client types                               ***/
 #define CLT_CAPMGR 0x01
 #define CLT_NORMAL 0x02

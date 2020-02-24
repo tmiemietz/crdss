@@ -18,6 +18,7 @@
 
 
 #define DEF_LIB_CFG_PATH "/home/mt/crdss/libcrdss.cfg"
+#define DEF_CAPMGR_SOCK  "/tmp/crdss-capmgr.sock"       /* capmgr dom. sock */
 
 /****************************************************************************   
  *                                                                          *   
@@ -68,6 +69,9 @@ struct crdss_srv_ctx {
     struct slist *unknown_compl;    /* completion for unknown workers       */
     pthread_mutex_t wait_lck;       /* lock for waiter list                 */
 };
+
+/***        forwards declarations for library-internal data types         ***/
+struct stat64;
 
 /****************************************************************************
  *                                                                          *
@@ -244,6 +248,19 @@ int query_srv_block(struct crdss_srv_ctx *sctx);
 
 /****************************************************************************
  *
+ * Queries the size of the vslice in ccap from the capability manager.
+ * The size returned in size is the size of vslice that the capability passed
+ * as input parameter refers to (given in Bytes).
+ *
+ * Params: ccap - capability that specifies the vslice to examine.
+ *         size - size of the requested vslice (output parameter).
+ *
+ * Returns: An error number as defined in src/include/protocol.h
+ */
+int get_vslice_size(struct crdss_clt_cap *ccap, uint64_t *size);
+
+/****************************************************************************
+ *
  * Reads len bytes from the storage location specified by didx, sidx and
  * saddr and stores them in the buffer pointed to by buf. This function uses
  * polling-based I/O completion with a doorbell memory address. For best
@@ -284,7 +301,7 @@ int fast_read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
  * Returns: The status of the operation, as defined in include/protocol.h.
  */
 int fast_write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
-                   uint64_t saddr, void *buf, uint32_t len);
+                   uint64_t saddr, const void *buf, uint32_t len);
 
 /****************************************************************************
  *
@@ -329,6 +346,22 @@ int read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
  * Returns: The status of the operation, as defined in include/protocol.h.
  */
 int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
-              uint64_t saddr, void *buf, uint32_t len);
+              uint64_t saddr, const void *buf, uint32_t len);
+
+/***                     POSIX interface emulation                        ***/
+
+/****************************************************************************
+ *
+ * Linux-specific system call wrapper for stat on systems with large file
+ * support.
+ */
+int __xstat64(int ver, const char *path, struct stat64 *stat_buf);
+
+/****************************************************************************
+ *
+ * Linux-specific system call wrapper for lstat on systems with large file
+ * support.
+ */
+ int __lxstat64(int ver, const char *path, struct stat64 *stat_buf);
 
 #endif /* LIBCRDSS_H */

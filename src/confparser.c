@@ -1067,3 +1067,45 @@ int check_libcfg(struct clt_lib_cfg *cfg) {
 
     return(0);
 }
+
+/* Partially inits a CRDSS client-side capability from a string.            */
+int init_ccap_from_path(char *path, struct crdss_clt_cap *ccap) {
+    int field = 0;                              /* position in path         */
+
+    char *tok;                                  /* fields for strtok_r      */
+    char *pos;
+
+    /* crdss prefix has to be present */
+    if (strncmp(path, "crdss", 5) != 0)
+        return(1);
+
+    memset(ccap, 0, sizeof(struct crdss_clt_cap));
+    ccap->srv.sin_family = AF_INET;
+    for (tok = strtok_r(path, "-", &pos); tok != NULL;
+         tok = strtok_r(NULL, "-", &pos)) {
+       
+        switch (field) {
+            case 1:
+                if (inet_pton(AF_INET, tok, &ccap->srv.sin_addr) != 1)
+                    return(1);
+
+                break;
+            case 2:
+                ccap->dev_idx = atoi(tok);
+                break;
+            case 3:
+                ccap->vslc_idx = atoi(tok);
+                break;
+            default:
+                break;
+        }
+
+        field++;
+    }
+
+    /* check if all information required was present */
+    if (field < 3)
+        return(1);
+
+    return(0);
+}

@@ -20,6 +20,7 @@
 #include <sys/un.h>                    /* domain sockets                    */
 
 #include "slist.h"                     /* single-linked lists               */
+#include "cap.h"                       /* crdss capabilities                */
 
 /****************************************************************************
  *                                                                          *
@@ -157,5 +158,21 @@ int parse_lib_config(char *confpath, struct clt_lib_cfg *cconf);
  *          the reason for the failure else (see implementation).
  */
 int check_libcfg(struct clt_lib_cfg *cfg);
+
+/****************************************************************************
+ *
+ * Partially inits a CRDSS client-side capability from a string passed to
+ * this function. The string is expected to be of the following form:
+ * "crdss_<ip addr of server>_<dev index>_<vslice index>". Upon successful
+ * return, the function will have filled the address of the server, the 
+ * device and the vslice index of the client capability. All other fields
+ * are set to zero / NULL.
+ *
+ * Params: path - string that contains the "path" to a CRDSS device.
+ *         ccap - pointer to client capability provided by the caller.
+ *
+ * Returns: 0 on success, 1 on error.
+ */
+int init_ccap_from_path(char *path, struct crdss_clt_cap *ccap);
 
 #endif /* PARSER_H */
