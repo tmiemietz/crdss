@@ -151,7 +151,7 @@ static int parse_raw(char *confpath, struct slist **elems) {
                 ! exp_ass) {
                 struct config_elem *elm = calloc(1, sizeof(struct config_elem));
               
-                fprintf(stderr, "Beginning new config elem %s\n", token);
+                /* fprintf(stderr, "Beginning new config elem %s\n", token); */
 
                 if (elm == NULL)
                     goto error_mem;
@@ -598,9 +598,11 @@ int parse_snic_config(char *confpath, struct snic_config *sconf) {
     ptr = conf_elems;
     while (ptr != NULL) {
         struct config_elem *elm = (struct config_elem *) ptr->data;
+        /*
         fprintf(stderr, "Elem name: %s\n", elm->elem_name);
         fprintf(stderr, "No. of attributes: %d\n", 
                 slist_length(elm->attributes));
+         */
 
         /* check for possible configuration elements */
         if (strcmp(elm->elem_name, "GLOBAL") == 0) {

@@ -1,3 +1,5 @@
 # .gitignore for the CRDSS project
 
-lib/*.o
+bin/*
+obj/*.o
+lib/*.so

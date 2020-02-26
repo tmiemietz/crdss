@@ -7,6 +7,8 @@
  ****************************************************************************/
 
 
+#define _GNU_SOURCE                      /* for the definition of O_DIRECT  */
+
 /****************************************************************************
  *                                                                          *
  *                           include statements                             *
@@ -19,7 +21,8 @@
 #include <string.h>                      /* string manipulation             */
 #include <unistd.h>                      /* UNIX standard calls             */
 #include <errno.h>                       /* information about errors        */
-#include <sys/stat.h>                   
+#include <sys/types.h>
+#include <sys/stat.h>         
 #include <fcntl.h>                       /* for bare open                   */
 #include <stdarg.h>                      /* for varargs                     */
 
@@ -42,6 +45,8 @@ struct crdss_bdev *stm_open_dev(char *path) {
     int                 fd;
     char         *path_cpy;                 /* copy of path to store in dev */
 
+    /* in order to obtain realistic values for testing with the kernel, use *
+     * O_DIRECT when opening files                                          */
     if ((fd = open(path, O_RDWR)) == -1) {
         logmsg(WARN, "Failed to open dev %s (%s), continuing...", path,
                strerror(errno));

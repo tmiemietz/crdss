@@ -22,6 +22,8 @@
 #include <errno.h>                          /* find out reasons for errors  */
 #include <arpa/inet.h>                      /* byte order conversion        */
 #include <time.h>                           /* for nanosleep                */
+#include <fcntl.h>                          /* set async fd to non-blocking */
+#include <poll.h>                           /* poll for async IB events     */
 
 #include "include/ibcomm.h"                 /* header for ibcomm impl.      */
 #include "include/protocol.h"               /* to compute size of msg bufs  */
@@ -60,11 +62,12 @@ static int get_ctx_by_guid(struct ib_ctx *ibctx, uint64_t guid) {
     struct ibv_port_attr pattr;
     union  ibv_gid port_gid;
 
+    logmsg(DEBUG, "Calling ibv_get_device_list...");
     if ((dev_list = ibv_get_device_list(&dev_cnt)) == NULL) {
         logmsg(ERROR, "Failed to open IB device list.");
         return(1);
     }
-    
+   
     /* iterate through all devices in the system */
     logmsg(DEBUG, "IB dev count is %d.", dev_cnt);
     for (i = 0; i < dev_cnt; i++) {
@@ -139,6 +142,8 @@ static int get_ctx_by_guid(struct ib_ctx *ibctx, uint64_t guid) {
 /* Initiates an InfiniBand RC queue pair on client side.                    */
 int init_clt_qp(struct ib_ctx *ibctx, uint64_t guid, unsigned char **msgbuf, 
                 uint32_t msg_cnt, unsigned char **rdmabuf, uint32_t rdmasize) {
+    int flags;                          /* flags of the dev_ctx async fd    */
+
     struct ibv_qp_init_attr iattr;      /* attributes for initializing a    *
                                          * queue pair                       */
 
@@ -157,12 +162,22 @@ int init_clt_qp(struct ib_ctx *ibctx, uint64_t guid, unsigned char **msgbuf,
 
         return(1);
     }
-
+    
+    logmsg(DEBUG, "Getting dev ctx.\n");
     /* open the IB device identified by guid and save the port no. in ibctx */
     if (get_ctx_by_guid(ibctx, guid) != 0) {
         logmsg(ERROR, "Failed to open IB device with port GUID %#lx. "
                "Make sure that the GUID is correct...", guid);
         goto err_mem;
+    }
+    logmsg(DEBUG, "dev ctx acquired.\n");
+   
+    /* change the event fd of the device context to non-blocking            */
+    flags = fcntl(ibctx->dev_ctx->async_fd, F_GETFL);
+    if (fcntl(ibctx->dev_ctx->async_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        logmsg(ERROR, "Failed to set async fd of device context to "
+               "non-blocking (errno %d).", errno);
+        goto err_pd;
     }
 
     /* allocate completion channel and protection domain                    */
@@ -179,6 +194,7 @@ int init_clt_qp(struct ib_ctx *ibctx, uint64_t guid, unsigned char **msgbuf,
         goto err_pd;
     }
 
+    logmsg(DEBUG, "Registering memory regions.");
     /* register memory regions for send / receive buffer areas as well as for*
      * the rdma data transfer areas, we will only use RDMA write so nor      *
      * IBV_ACCESS_REMOTE_READ flag has to be set                             */
@@ -205,7 +221,7 @@ int init_clt_qp(struct ib_ctx *ibctx, uint64_t guid, unsigned char **msgbuf,
     }
 
     /* create a completion queue, maybe investigate on the IRQ vector later */
-    ibctx->cq = ibv_create_cq(ibctx->dev_ctx, msg_cnt, NULL,
+    ibctx->cq = ibv_create_cq(ibctx->dev_ctx, 2 * msg_cnt, NULL,
                               ibctx->cchannel, 0);
     if (ibctx->cq == NULL)
         goto err_cq;
@@ -424,7 +440,7 @@ int post_msg_sr(struct ib_ctx *ibctx, unsigned char *msg_addr, uint32_t imm) {
     struct ibv_send_wr swr;                 /* send work request            */
     struct ibv_sge sge;                     /* scatter/gather entry for wr  */
     struct ibv_send_wr *bad;
-
+    
     memset(&swr, 0, sizeof(struct ibv_send_wr));
     memset(&sge, 0, sizeof(struct ibv_sge));
 
@@ -443,6 +459,7 @@ int post_msg_sr(struct ib_ctx *ibctx, unsigned char *msg_addr, uint32_t imm) {
      * since message buffers can be reused immediately after post_recv ret. */
     swr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
 
+    /* logmsg(DEBUG, "Posting send request for ctx %p.", ibctx); */
     ret = ibv_post_send(ibctx->qp, &swr, &bad);
     if (ret != 0) {
         logmsg(ERROR, "Failed to post send request (%d).", ret);
@@ -472,7 +489,7 @@ int init_rdma_transfer(struct ib_ctx *ibctx, unsigned char *loc_addr,
     /* ID is offset in RDMA buffer or immediate value on signaled send      */
     swr.wr_id      = (signaled == 0)
                    ? (uint64_t) rem_addr - ibctx->remote_addr
-                   : imm;
+                   : (uint64_t) imm;
     swr.next       = NULL;                  /* only send one msg at a time  */
     swr.sg_list    = &sge;
     swr.num_sge    = 1;
@@ -490,6 +507,7 @@ int init_rdma_transfer(struct ib_ctx *ibctx, unsigned char *loc_addr,
         swr.imm_data = htonl(imm);
     }
 
+    logmsg(DEBUG, "Starting RDMA transfer with wr ID: %lu.", swr.wr_id);
     ret = ibv_post_send(ibctx->qp, &swr, &bad);
     if (ret != 0) {
         logmsg(ERROR, "Failed to post send request (%d).", ret);
@@ -580,12 +598,21 @@ int destroy_ibctx(struct ib_ctx *ibctx) {
 
 /* Reads the next control message from an InfiniBand queue pair.            */
 int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
+    int evt_res  = 0;
+    struct pollfd evt_pfd;
+    struct ibv_async_event evt;
+
     int poll_res = 0;                       /* result of IB poll operation  */
 
     struct ibv_cq *cq;
     void *compl_ctx;                        /* completion context (set to   *
                                              * NULL during init)            */
     struct ibv_wc cqe;                      /* completion entry             */
+
+    memset(&evt, 0, sizeof(struct ibv_async_event));
+    memset(&evt_pfd, 0, sizeof(struct pollfd));
+    evt_pfd.fd     = ibctx->dev_ctx->async_fd;
+    evt_pfd.events = POLLIN;
 
     while (poll_res == 0) {
         if (ibv_get_cq_event(ibctx->cchannel, &cq, &compl_ctx) == -1) {
@@ -616,16 +643,39 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
 
         /* suppress successful send operations */
         if (cqe.opcode == IBV_WC_SEND && cqe.status == IBV_WC_SUCCESS) {
-            logmsg(DEBUG, "Skipping send request.");
+            if (cqe.wc_flags & IBV_WC_WITH_IMM) {
+                logmsg(DEBUG, "Skipping send request (id %lu, imm %u)", 
+                       cqe.wr_id, cqe.imm_data);
+            }
+            else
+                logmsg(DEBUG, "Skipping send request.");
+            
             poll_res = 0;
+        }
+
+        /* check the IB async queue for events */
+        evt_res = poll(&evt_pfd, 1, 0);
+        if (evt_res < 0)
+            logmsg(WARN, "Could not poll IB async event queue");
+        if (evt_res == 1) {
+            /* there is an async event */
+            ibv_get_async_event(ibctx->dev_ctx, &evt);
+            logmsg(INFO, "Received async event in ctx %p: %s", ibctx,
+                   ibv_event_type_str(evt.event_type));
+            ibv_ack_async_event(&evt);
         }
     }
 
-    logmsg(DEBUG, "CQE opcode is: %u.", cqe.opcode);
-    logmsg(DEBUG, "CQE status is: %u.", cqe.status);
     if (cqe.status != IBV_WC_SUCCESS) {
-        logmsg(WARN, "CQE provided error code %u.", cqe.status);
+        logmsg(WARN, "CQE (CQ %p) provided error code %u (%s).", cq, cqe.status,
+               ibv_wc_status_str(cqe.status));
+        logmsg(WARN, "CQE wr_id is: %lu.", cqe.wr_id);
         return((int) cqe.status);
+    }
+    else {
+        logmsg(DEBUG, "CQE opcode is: %u.", cqe.opcode);
+        logmsg(DEBUG, "CQE status is: %u.", cqe.status);
+        logmsg(DEBUG, "CQE wr_id is: %lu.", cqe.wr_id);
     }
 
     *msg = (unsigned char *) cqe.wr_id;     /* cast ID back to buffer ptr   */
@@ -639,6 +689,7 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
     /* if an immediate value was sent, hand it to the receiver */
     if (cqe.wc_flags & IBV_WC_WITH_IMM) {
         *imm = ntohl(cqe.imm_data);
+        logmsg(DEBUG, "Received immediate %u.", *imm);
     }
 
     return(0);
@@ -667,7 +718,13 @@ int poll_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
 
         /* suppress successful send operations */
         if (cqe.opcode == IBV_WC_SEND && cqe.status == IBV_WC_SUCCESS) {
-            logmsg(DEBUG, "Skpping send request.");
+            if (cqe.wc_flags & IBV_WC_WITH_IMM) {
+                logmsg(DEBUG, "Skipping send request (id: %lu, imm %u)", 
+                       cqe.wr_id, cqe.imm_data);
+            }
+            else
+                logmsg(DEBUG, "Skipping send request.");
+
             poll_res = 0;
         }
 
@@ -680,11 +737,16 @@ int poll_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
         }
     }
 
-    logmsg(DEBUG, "CQE opcode is: %u.", cqe.opcode);
-    logmsg(DEBUG, "CQE status is: %u.", cqe.status);
     if (cqe.status != IBV_WC_SUCCESS) {
-        logmsg(WARN, "CQE provided error code %u.", cqe.status);
+        logmsg(WARN, "CQE provided error code %u (%s).", cqe.status,
+               ibv_wc_status_str(cqe.status));
+        logmsg(WARN, "CQE wr_id is: %lu.", cqe.wr_id);
         return((int) cqe.status);
+    }
+    else {
+        logmsg(DEBUG, "CQE opcode is: %u.", cqe.opcode);
+        logmsg(DEBUG, "CQE status is: %u.", cqe.status);
+        logmsg(DEBUG, "CQE wr_id is: %lu.", cqe.wr_id);
     }
 
     *msg = (unsigned char *) cqe.wr_id;     /* cast ID back to buffer ptr   */
@@ -698,6 +760,7 @@ int poll_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
     /* if an immediate value was sent, hand it to the receiver */
     if (cqe.wc_flags & IBV_WC_WITH_IMM) {
         *imm = ntohl(cqe.imm_data);
+        logmsg(DEBUG, "Received immediate %u.", *imm);
     }
 
     return(0);

@@ -65,6 +65,9 @@
  ****************************************************************************
  ****************************************************************************/
 int main(int argc, char **argv) {
+    unsigned int i;
+
+    struct ibv_wc cqe[5];
     struct crdss_clt_cap cap;
     struct crdss_srv_ctx *sctx;
 
@@ -197,6 +200,27 @@ int main(int argc, char **argv) {
         != 0) {
         printf("Failed to write to remote device...\n");
         return(1);
+    }
+    printf("Done.\n");
+
+    printf("Executing read /write loop 1000000 times.\n");
+    for (i = 0; i < 1000000; i++) {
+        if (fast_read_raw(sctx, cap.dev_idx, cap.vslc_idx, 0, iobuf, buf_len) 
+            != 0) {
+            printf("Failed to re-read buffer (fast path)...\n");
+            return(1);
+        }
+
+        memset(iobuf, 0, buf_len);
+        memcpy(iobuf, "Sample Data 123...", buf_len - 1);
+        
+        if (fast_write_raw(sctx, cap.dev_idx, cap.vslc_idx, 0, iobuf, buf_len) 
+            != 0) {
+            printf("Failed to write to remote device...\n");
+            return(1);
+        }
+
+        printf("r/w cycle %u (%u).\n", i, ibv_poll_cq(sctx->ibctx.cq, 5, cqe));
     }
     printf("Done.\n");
 

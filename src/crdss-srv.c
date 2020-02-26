@@ -1580,8 +1580,9 @@ static void *ib_worker(void *ctx) {
     logmsg(DEBUG, "Handler %lu: Started IB worker thread.", handler->tid);
     while (1) {
         if (get_next_msg_type(handler, &msg, &msg_type, &imm) != 0) {
-            logmsg(ERROR, "IB worker: Unable to receive message. Terminating.");
-            return(NULL);
+            logmsg(ERROR, "Handler %lu: IB Worker: Error in InfiniBand "
+                   "communication.", handler->tid);
+            return(NULL); 
         }
 
         switch (msg_type) {
@@ -2207,7 +2208,7 @@ static void handle_normal_clt(struct handler *handler) {
                 handler->ibctx->remote_rkey = ntohl(clt_rkey);
 
                 /* start IB worker threads */
-                logmsg(DEBUG, "Handler %lu: Creating %u IB worker threads.",
+                logmsg(INFO, "Handler %lu: Creating %u IB worker threads.",
                     handler->tid, handler->worker_cnt);
                 for (i = 0; i < handler->worker_cnt; i++) {
                     if (pthread_create(&handler->ib_workers[i], NULL, ib_worker, 
@@ -2822,9 +2823,9 @@ int main(int argc, char **argv) {
     /* set log path. if logpath == NULL, stderr is used since the server    *
      * won't run as a daemon in this case (see error conditions above)      */
     if (logpath != NULL)
-        init_logger(logpath, DEBUG);
+        init_logger(logpath, INFO);
     else
-        init_logger("/dev/stderr", DEBUG);        
+        init_logger("/dev/stderr", INFO);        
 
     /* logpath-related memory is no longer needed, free it immediately      */
     if (logdir != NULL)
@@ -2843,6 +2844,7 @@ int main(int argc, char **argv) {
     /*** !!! ONLY TEMPORARILY FOR TESTING !!! ***/
     /* init first block device with a static stm */
     if (devs != NULL) {
+        logmsg(WARN, "Destroying data layout for testing...");
         sstm_init((struct crdss_bdev *) devs->data, 10);
         sstm_mkvslc((struct crdss_bdev *) devs->data);
     }

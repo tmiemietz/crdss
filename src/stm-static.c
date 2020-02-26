@@ -26,6 +26,7 @@
 
 #include <stdlib.h>                      /* memory allocation etc.          */
 #include <stdint.h>                      /* fixed-width integers            */
+#include <errno.h>                       /* error numbers                   */
 #include <unistd.h>                      /* UNIX standard calls             */
 #include <sys/ioctl.h>
 #include <linux/fs.h>                    /* get bdev size on linux          */
@@ -91,7 +92,7 @@ int sstm_init(struct crdss_bdev *dev, unsigned int vslc_cnt) {
     /* update context structure and write slice table to disk */
     if (pwrite(dev->fd, &stm_type, sizeof(uint32_t), 0) < 
         (ssize_t) sizeof(uint32_t)) {
-        logmsg(ERROR, "sstm_init: Failed to write disk label");
+        logmsg(ERROR, "sstm_init: Failed to write disk label (%d)", errno);
         goto err; 
     }
 

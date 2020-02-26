@@ -3,7 +3,7 @@
 #
 
 # unfortunately, we can not use the one and only C (89) due to RDMA libraries
-CFLAGS := -Wall -Wextra -Werror -pedantic -O2 -fPIC
+CFLAGS := -Wall -Wextra -Werror -O2 -fPIC
 
 SRCDIR := src
 OBJDIR := obj
@@ -12,7 +12,7 @@ INCDIR := src/include
 TGTDIR := bin
 TGTS   := crdss-srv crdss-capmgr libcrdss testclt
 
-LIBS   := -lpthread -lsodium -libverbs
+LIBS   := -lpthread -lsodium -libverbs -ldl
 
 #
 # Actual commands below
@@ -27,19 +27,19 @@ all: $(TGTS)
 
 crdss-srv: obj/crdss-srv.o $(filter-out $(TGTOBJS), $(OBJECTS))
 	@echo "Linking $@..."
-	$(CC) -o $(TGTDIR)/$@ $^ $(LIBS)
+	$(CC) -pedantic -o $(TGTDIR)/$@ $^ $(LIBS)
 
 crdss-capmgr: obj/crdss-capmgr.o $(filter-out $(TGTOBJS), $(OBJECTS))
 	@echo "Linking $@..."
-	$(CC) -o $(TGTDIR)/$@ $^ $(LIBS)
+	$(CC) -pedantic -o $(TGTDIR)/$@ $^ $(LIBS)
 
 testclt: obj/testclt.o $(filter-out $(TGTOBJS), $(OBJECTS))
 	@echo "Linking $@..."
-	$(CC) -o $(TGTDIR)/$@ -Llib $^ $(LIBS) -lcrdss
+	$(CC) -pedantic -o $(TGTDIR)/$@ -Llib $^ $(LIBS) -lcrdss
 
 libcrdss: obj/libcrdss.o $(filter-out $(TGTOBJS), $(OBJECTS))
 	@echo "Linking $@..."
-	$(CC) -shared -o lib/$@.so $^
+	$(CC) -shared -o lib/$@.so $^ $(LIBS)
 
 $(OBJDIR)/%.o: $(SOURCES) $(HEADERS)
 	@echo "Building object file $@..."
