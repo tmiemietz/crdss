@@ -72,7 +72,7 @@ int main(int argc, char **argv) {
     struct crdss_srv_ctx *sctx;
 
     unsigned char *iobuf;
-    size_t buf_len = strlen("Sample Data 123...") + 1;
+    size_t buf_len = 4096;
 
     uint64_t guid = (uint64_t) strtoull(CLT_GUID, NULL, 0);
 
@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
     cap.dev_idx    = 0;
     cap.vslc_idx   = 0;
     cap.start_addr = 0;
-    cap.end_addr   = 2047;
+    cap.end_addr   = 4096;
     cap.rights     = CAP_READ | CAP_WRITE;
     cap.key        = NULL;
 
@@ -194,7 +194,7 @@ int main(int argc, char **argv) {
 
     printf("Rewriting buffer a second time (fast path)...\n");
     memset(iobuf, 0, buf_len);
-    memcpy(iobuf, "Sample Data 123...", buf_len - 1);
+    memcpy(iobuf, "Sample Data 123...", strlen("Sample Data 123..."));
         
     if (fast_write_raw(sctx, cap.dev_idx, cap.vslc_idx, 0, iobuf, buf_len) 
         != 0) {
@@ -203,8 +203,8 @@ int main(int argc, char **argv) {
     }
     printf("Done.\n");
 
-    printf("Executing read /write loop 1000000 times.\n");
-    for (i = 0; i < 1000000; i++) {
+    printf("Executing read /write loop 100000 times.\n");
+    for (i = 0; i < 100000; i++) {
         if (fast_read_raw(sctx, cap.dev_idx, cap.vslc_idx, 0, iobuf, buf_len) 
             != 0) {
             printf("Failed to re-read buffer (fast path)...\n");
@@ -212,7 +212,7 @@ int main(int argc, char **argv) {
         }
 
         memset(iobuf, 0, buf_len);
-        memcpy(iobuf, "Sample Data 123...", buf_len - 1);
+        memcpy(iobuf, "Sample Data 123...", strlen("Sample Data 123"));
         
         if (fast_write_raw(sctx, cap.dev_idx, cap.vslc_idx, 0, iobuf, buf_len) 
             != 0) {

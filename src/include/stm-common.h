@@ -98,6 +98,7 @@ struct crdss_bdev {
     void *stm_ctx;                    /* context data of stm implementation */
     
     unsigned int state;               /* state of the device                */
+    unsigned int block_sz;            /* physical block size of device      */
 
     pthread_mutex_t meta_lck;         /* lock for metadata operations       */
 

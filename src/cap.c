@@ -14,6 +14,7 @@
  *                                                                          *
  ****************************************************************************/
 
+
 #include <stdint.h>                     /* fixed-width integers             */
 #include <sys/socket.h>                 /* to use sockets                   */
 #include <arpa/inet.h>                  /* byte order conversion            */
@@ -142,7 +143,7 @@ int clt_cap_is_subset(struct crdss_clt_cap *cap1, struct crdss_clt_cap *cap2) {
 
     /* the union of both right sets has to be equal to cap2->rights (i.e.,  *
      * cap1 has no right bits set that are not present in cap2              */
-    if ((cap1->rights | cap2->rights) != cap2->rights)
+    if ((cap1->rights | cap2->rights) != cap2->rights) 
         return(1);
 
     return(0);

@@ -464,6 +464,8 @@ static int relay_mkcap2(unsigned char *msg_buf, struct ucred *creds,
     new_cap->key[key_len - 1] = '\0';
     
     logmsg(DEBUG, "Client UID is %u.", creds->uid);
+    logmsg(DEBUG, "Req. cap saddr is %lu.", new_cap->start_addr);
+    logmsg(DEBUG, "Req. cap eaddr is %lu.", new_cap->end_addr);
 
     /* check whether a capability as specified by the client was configured */
     for (lptr = capmgr_cfg.caps; lptr != NULL; lptr = lptr->next) {

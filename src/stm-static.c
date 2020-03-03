@@ -14,8 +14,11 @@
  ****************************************************************************/
 
 
+/* maximum size of a vslice table for the static storage manager            */
+#define SSTM_VSLC_TBL_SZ 4096
+
 /* offset for vslice allocation bytemap on disk                             */
-#define BM_OFFS (sizeof(uint32_t) + 3 * sizeof(uint64_t))
+#define BM_OFFS (2 * sizeof(uint32_t) + 2 * sizeof(uint64_t))
 
 /****************************************************************************
  *                                                                          *
@@ -26,6 +29,7 @@
 
 #include <stdlib.h>                      /* memory allocation etc.          */
 #include <stdint.h>                      /* fixed-width integers            */
+#include <string.h>                      /* for memcpy                      */
 #include <errno.h>                       /* error numbers                   */
 #include <unistd.h>                      /* UNIX standard calls             */
 #include <sys/ioctl.h>
@@ -50,8 +54,13 @@ int sstm_init(struct crdss_bdev *dev, unsigned int vslc_cnt) {
     struct stm_static_ctx *ctx;
     uint8_t               *slc_bm;
 
-    /* buffer for writing stm type to disk */
-    uint32_t               stm_type = STM_TYPE_STATIC;
+    /* buffer for writing vslice table (4096 B), use a buffer instead of    *
+     * writing the fields separately in order to support direct I/O         */
+    unsigned char table_buf[SSTM_VSLC_TBL_SZ] 
+                    __attribute__ ((__aligned__(512)));
+
+    /* buffer for stm type */
+    uint32_t stm_type = STM_TYPE_STATIC;
 
     uint64_t slcsz;                         /* slice size in bytes          */
     uint64_t devsz;                         /* block device size in bytes   */
@@ -72,7 +81,7 @@ int sstm_init(struct crdss_bdev *dev, unsigned int vslc_cnt) {
     logmsg(INFO, "sstm_init: new slice size is %lu B (%lu MiB)", 
            slcsz, slcsz / 1024 / 1024);
 
-    if ((ctx = malloc(sizeof(struct stm_static_ctx))) == NULL) {
+    if ((ctx = calloc(1, sizeof(struct stm_static_ctx))) == NULL) {
         logmsg(ERROR, "sstm_init: memory allocation for stm context failed");
         return(-1);
     }
@@ -89,23 +98,17 @@ int sstm_init(struct crdss_bdev *dev, unsigned int vslc_cnt) {
 
     pthread_mutex_lock(&dev->meta_lck);
 
+    /* fill vslice table buffer */
+    memcpy(table_buf, &stm_type, 4);
+    memcpy(table_buf + 4, &ctx->part_cnt, 4);
+    memcpy(table_buf + 8, &ctx->part_size, 8);
+    memcpy(table_buf + 16, &ctx->vslc_offset, 8);
+    memcpy(table_buf + 24, slc_bm, vslc_cnt * sizeof(uint8_t));
+
     /* update context structure and write slice table to disk */
-    if (pwrite(dev->fd, &stm_type, sizeof(uint32_t), 0) < 
-        (ssize_t) sizeof(uint32_t)) {
-        logmsg(ERROR, "sstm_init: Failed to write disk label (%d)", errno);
+    if (pwrite(dev->fd, table_buf, 4096, 0) < (ssize_t) 4096) {
+        logmsg(ERROR, "sstm_init: Failed to write vslice table (%d).", errno);
         goto err; 
-    }
-
-    if (pwrite(dev->fd, &ctx->part_cnt, 3 * sizeof(uint64_t), sizeof(uint32_t))< 
-        (ssize_t) (3 * sizeof(uint64_t))) {
-        logmsg(ERROR, "sstm_init: Failed to write slice props to disk");
-        goto err;
-    }
-
-    if (pwrite(dev->fd, slc_bm, vslc_cnt * sizeof(uint8_t), BM_OFFS) < 
-        (ssize_t) (vslc_cnt * sizeof(uint8_t))) {
-        logmsg(ERROR, "sstm_init: Failed to write allocation map to disk");
-        goto err;
     }
 
     if (fsync(dev->fd) == -1) {
@@ -130,17 +133,25 @@ int sstm_rd_vslctbl(struct crdss_bdev *dev) {
     struct stm_static_ctx *ctx;
     uint8_t               *vlsbm;               /* vslice bytemap           */
 
+    /* buffer for writing vslice table (4096 B), use a buffer instead of    *
+     * writing the fields separately in order to support direct I/O         */
+    unsigned char table_buf[SSTM_VSLC_TBL_SZ] 
+                    __attribute__ ((__aligned__(512)));
+    
     if ((ctx = malloc(sizeof(struct stm_static_ctx))) == NULL) {
         logmsg(ERROR, "Failed to allocate memory for sstm context");
         return(-1);
     }
 
-    if (pread(dev->fd, &ctx->part_cnt, 3 * sizeof(uint64_t), 
-        (off_t) sizeof(uint32_t)) < (ssize_t) (3 * sizeof(uint64_t))) {
+    if (pread(dev->fd, table_buf, 4096, 0) < (ssize_t) 4096) {
         logmsg(ERROR, "Failed to read sstm vslice table");
         free(ctx);
         return(-1);
     }
+
+    memcpy(&ctx->part_cnt, table_buf + 4, 4);
+    memcpy(&ctx->part_size, table_buf + 8,  8);
+    memcpy(&ctx->vslc_offset, table_buf + 16,  8);
 
     vlsbm = malloc((size_t) ctx->part_cnt);
     if (vlsbm == NULL) {
@@ -148,16 +159,8 @@ int sstm_rd_vslctbl(struct crdss_bdev *dev) {
         free(ctx);
         return(-1);
     }
-
-    if (pread(dev->fd, vlsbm, ctx->part_cnt, BM_OFFS) < 
-        (ssize_t) ctx->part_cnt) {
-        
-        logmsg(ERROR, "Failed to read sstm allocation bitmap");
-        free(ctx);
-        free(vlsbm);
-        return(-1);
-    }
-
+    memcpy(vlsbm, table_buf + 24, ctx->part_cnt * sizeof(uint8_t));
+    
     ctx->act_vslc = vlsbm;
     pthread_mutex_lock(&dev->meta_lck);
     dev->stm_ctx = ctx;
@@ -168,12 +171,16 @@ int sstm_rd_vslctbl(struct crdss_bdev *dev) {
 /* Creates a new virtual slice.                                             */
 int sstm_mkvslc(struct crdss_bdev *dev) {
     unsigned int i;
-    uint8_t      write_buf = 1;         /* data to write on disk            */
 
     int next_slc_idx = -1;              /* index of next free slice         */
 
     struct stm_static_ctx *ctx = (struct stm_static_ctx *) dev->stm_ctx;
 
+    /* buffer for writing vslice table (4096 B), use a buffer instead of    *
+     * writing the fields separately in order to support direct I/O         */
+    unsigned char table_buf[SSTM_VSLC_TBL_SZ] 
+                __attribute__ ((__aligned__(512)));
+    
     pthread_mutex_lock(&dev->meta_lck);
     for (i = 0; i < ctx->part_cnt; i++) {
         if (ctx->act_vslc[i] == 0) {
@@ -189,9 +196,16 @@ int sstm_mkvslc(struct crdss_bdev *dev) {
         return(-1);
     }
 
+    /* read vslice table from disk                                          */
+    if (pread(dev->fd, table_buf, SSTM_VSLC_TBL_SZ, 0) < SSTM_VSLC_TBL_SZ) {
+        logmsg(ERROR, "mkvslc: Failed to read vslice table (%d).", errno);
+        pthread_mutex_unlock(&dev->meta_lck);
+        return(-1);
+    }
+    memset(table_buf + BM_OFFS + next_slc_idx * sizeof(uint8_t), 1, 1);
+
     /* if a slice is available, update metadata in memory and on disk       */
-    if (pwrite(dev->fd, &write_buf, sizeof(uint8_t), 
-        BM_OFFS + next_slc_idx * sizeof(uint8_t)) < (ssize_t) sizeof(uint8_t)) {
+    if (pwrite(dev->fd, table_buf, SSTM_VSLC_TBL_SZ, 0) < SSTM_VSLC_TBL_SZ) {
         logmsg(ERROR, "mkvslc: Failed to write updated metadata to disk");
         pthread_mutex_unlock(&dev->meta_lck);
         return(-1);
@@ -309,7 +323,7 @@ struct vslc_info *sstm_info(struct crdss_bdev *dev) {
     pthread_mutex_lock(&dev->meta_lck);
     for (i = 0; i < ctx->part_cnt; i++) {
         if (ctx->act_vslc[i] == 1) {
-            slice = malloc(sizeof(struct vslice));
+            slice = calloc(1, sizeof(struct vslice));
             if (slice == NULL || slist_insert(&slc_list, slice)) {
                 logmsg(WARN, "sstm_info: skipping vslice due to alloc error");
                 if (slice != NULL)
@@ -327,7 +341,7 @@ struct vslc_info *sstm_info(struct crdss_bdev *dev) {
     }
     pthread_mutex_unlock(&dev->meta_lck);
 
-    if ((info = malloc(sizeof(struct vslc_info))) == NULL) {
+    if ((info = calloc(1, sizeof(struct vslc_info))) == NULL) {
         logmsg(WARN, "Error on memory allocation during sstm_info");
         /* tear down slice list again */
         while (slc_list != NULL) {

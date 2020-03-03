@@ -871,11 +871,11 @@ int parse_snic_config(char *confpath, struct snic_config *sconf) {
                 }
                 else if (strcmp(attr->key, "start_addr") == 0) {
                     char *addr_str  = (char *) attr->values->data;
-                    cap->start_addr = (uint64_t) atol(addr_str);
+                    cap->start_addr = (uint64_t) strtoull(addr_str, NULL, 0);
                 }
                 else if (strcmp(attr->key, "end_addr") == 0) {
                     char *addr_str = (char *) attr->values->data;
-                    cap->end_addr  = (uint64_t) atoi(addr_str);
+                    cap->end_addr  = (uint64_t) strtoull(addr_str, NULL, 0);
                 }
                 else if (strcmp(attr->key, "rights") == 0) {
                     cap->rights = permstrtoi(attr->values);

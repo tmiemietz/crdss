@@ -21,13 +21,19 @@
 #define WORKER_UNREG UINT16_MAX
 
 /* size of a single cache line in Bytes (== size for doorbell fields)       */
-#define CL_SIZE 64
+#define CL_SIZE 512             /* for alignment of send buffers            */
 
 /* maximum file descriptor that can be used for CRDSS files                 */
 #define LIBCRDSS_MAX_FD 1024
 
 /* IB GUID for testing (make variable for release)                          */
 #define LIBCRDSS_TEST_GUID "0xf45214030010a4e1"
+
+/* number of retries if send queue is full                                  */
+#define LIBCRDSS_SQ_FRT 5
+
+/* interval to wait between checks of doorbell register in us               */
+#define LIBCRDSS_POLL_INT 2
 
 /****************************************************************************
  *                                                                          *
@@ -78,6 +84,7 @@ struct wctx {
 
 /* structure for emulating POSIX files                                      */
 struct crdss_posix_file {
+    char  *name;                        /* file name                        */
     struct crdss_srv_ctx *sctx;         /* server connection for this file  */
     struct crdss_clt_cap cap;           /* cap for file access              */
 
@@ -265,7 +272,7 @@ static void *completion_worker(void *ctx) {
     struct slist *lptr;                 /* ptr for list iteration           */
 
     while (1) {
-        ret = get_next_ibmsg(&sctx->ibctx, &msg, &imm);
+        ret = poll_next_ibmsg(&sctx->ibctx, &msg, &imm);
         logmsg(DEBUG, "comp worker: got new message (imm = %u)!", imm);
 
         pthread_mutex_lock(&sctx->wait_lck);
@@ -984,20 +991,24 @@ int query_srv_poll(struct crdss_srv_ctx *sctx) {
     msg_buf[0] = MTYPE_CPOLL;
 
     if (post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid) != 0) {
+        logmsg(ERROR, "Can not send request to server.");
         /* failed to trigger IB send op. */
         return(1);
     }
 
     if (wait_for_ibmsg(work_ctx, work_ctx->tid) != 0) {
         /* receive op failed */
+        logmsg(ERROR, "Unable to receive answer from server.");
         post_msg_rr(&sctx->ibctx, work_ctx->msg, 1);
         return(1);
     }
 
     op_res = (uint8_t) work_ctx->msg[0];
     /* repost receive request */
-    if (post_msg_rr(&sctx->ibctx, work_ctx->msg, 1) != 0)
+    if (post_msg_rr(&sctx->ibctx, work_ctx->msg, 1) != 0) {
+        logmsg(WARN, "Failed to re-post receive request.");
         return(1);
+    }
 
     return(op_res);
 }
@@ -1090,6 +1101,8 @@ int get_vslice_size(struct crdss_clt_cap *ccap, uint64_t *size) {
 /* Reads len bytes from the storage location specified.                     */
 int fast_read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
                   uint64_t saddr, void *buf, uint32_t len) {
+    int ret;                        /* return value of function calls       */
+
     uint16_t didx_nw;               /* parameters in network byte order     */
     uint32_t sidx_nw;
     uint64_t saddr_nw;
@@ -1151,15 +1164,20 @@ int fast_read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
 
         /* logmsg(DEBUG, "TID of calling thread is %u.", work_ctx->tid); */
         logmsg(DEBUG, "fast_read_raw: sending request to server.");
-        if (post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid) != 0) {
-            /* failed to post send request */
-            return(R_FAILURE);
+        while ((ret = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid)) == 12){
+            /* failed to post send request, but retry once SQ is polled     */
+            usleep(LIBCRDSS_POLL_INT);
         }
+
+        /* if we left the loop, this indicates either success or a severe err */
+        if (ret != 0)
+            return(1);
 
         /* spin in this loop until the result arrived */
         logmsg(DEBUG, "fast_read_raw: spinning on addr %p.", (void *) pf_ptr);
-        while (*pf_ptr == R_UNDEF) 
-            ;
+        while (*pf_ptr == R_UNDEF) { 
+            /* usleep(LIBCRDSS_POLL_INT); */
+        }
 
         if (*pf_ptr != R_SUCCESS)
             return(*pf_ptr);
@@ -1178,6 +1196,8 @@ int fast_read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
 /* Writes len bytes to the storage location specified                       */
 int fast_write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
                    uint64_t saddr, const void *buf, uint32_t len) {
+    int ret;                        /* result of function calls             */
+
     uint16_t didx_nw;               /* parameters in network byte order     */
     uint32_t sidx_nw;
     uint64_t saddr_nw;
@@ -1251,14 +1271,22 @@ int fast_write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
             return(R_FAILURE);
         }
 
-        if (post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid) != 0) {
+        /* trigger the actual request at the server */
+        while ((ret = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid)) == 12){
+            /* failed to post send request, but retry once SQ is polled     */
+            usleep(LIBCRDSS_POLL_INT);
+        }
+
+        /* if we left the loop, this indicates either success or a severe err */
+        if (ret != 0) {
             /* failed to post send request */
-            return(R_FAILURE);
+            return(1);
         }
 
         /* spin in this loop until the result arrived */
-        while (*pf_ptr == R_UNDEF)
-            ;
+        while (*pf_ptr == R_UNDEF) {
+            /* usleep(LIBCRDSS_POLL_INT); */
+        }
 
         if (*pf_ptr != R_SUCCESS)
             return(*pf_ptr);
@@ -1307,6 +1335,8 @@ int read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
     sctx->avail_lbuf = slist_remove(sctx->avail_lbuf, sctx->avail_lbuf->data); 
 
     pthread_mutex_unlock(&sctx->lbuf_lck);
+
+    logmsg(DEBUG, "read_raw: acquired RDMA buffer.");
 
     /* convert parameters to network byte order */
     didx_nw       = htons(didx);
@@ -1458,11 +1488,7 @@ int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         logmsg(DEBUG, "write_raw: data transfer complete, sending msg.");
 
         op_res = (work_ctx->status == IBV_WC_SUCCESS) ? R_SUCCESS : R_FAILURE;
-        /* repost receive request */
-        if (post_msg_rr(&sctx->ibctx, work_ctx->msg, 1) != 0) {
-            op_res = R_FAILURE;
-            break;
-        }
+        /* we do not actually receive a message, hence do not repost an RR  */
 
         if (op_res != R_SUCCESS)
             break;
@@ -1628,7 +1654,7 @@ int __xstat64(int ver, const char *path, struct stat64 * stat_buf) {
     if (strncmp(basename, "crdss", 5) != 0)
         return(libc_xstat64(ver, path, stat_buf));
     
-    printf("Entering custom part of __xstat64!\n");
+    logmsg(DEBUG, "Entering custom part of __xstat64!\n");
     /* else: provide custom values for the crdss file */
     memset(stat_buf, 0, sizeof(struct stat64));
  
@@ -1690,7 +1716,7 @@ int __lxstat64(int ver, const char *path, struct stat64 * stat_buf) {
     if (strncmp(basename, "crdss", 5) != 0)
         return(libc_lxstat64(ver, path, stat_buf));
     
-    printf("Entering custom part of __lxstat64!\n");
+    logmsg(DEBUG, "Entering custom part of __lxstat64!\n");
     /* else: provide custom values for the crdss file */
     memset(stat_buf, 0, sizeof(struct stat64));
  
@@ -1730,6 +1756,10 @@ int __lxstat64(int ver, const char *path, struct stat64 * stat_buf) {
 
 /* System call wrapper for open.                                            */
 int open64(const char *pathname, int flags, ...) {
+/* #ifdef REUSE_FNAME */
+    int i = 0;
+/* #endif */
+
     char *basename = NULL;              /* basename of path                 */
     char *last_sep = NULL;              /* last occurence of '/' in path    */
 
@@ -1756,19 +1786,34 @@ int open64(const char *pathname, int flags, ...) {
         va_start(arglist, flags);
         ret = libc_open64(pathname, flags, arglist);
         va_end(arglist);
+        free(basename);
         return(ret);
     }
 
     fprintf(stderr, "Entering custom part of open64!\n");
-    
+
+/* #ifdef REUSE_FNAME */
+    /* check if there is already a session for the file specified */
+    for (i = 0; i < LIBCRDSS_MAX_FD; i++) {
+        if (fd_table[i] != NULL && strcmp(basename, fd_table[i]->name) == 0) {
+            /* file name is already opened */
+            free(basename);
+            return(i);
+        }
+    }
+/* #endif */
+
     /* if not done yet, connect to capability manager */
-    if (capmgr_fd == -1 && connect_capmgr_dom(DEF_CAPMGR_SOCK) != 0)
+    if (capmgr_fd == -1 && connect_capmgr_dom(DEF_CAPMGR_SOCK) != 0) {
+        free(basename);
         return(-1);
+    }
 
     if ((pfile = calloc(1, sizeof(struct crdss_posix_file))) == NULL) {
         errno = ENOMEM;
         goto file_alloc_err;
     }
+    pfile->name = basename;
 
     /* try to derive basic information about requested device from path     */
     if (init_ccap_from_path(basename, &pfile->cap) != 0) {
@@ -1823,7 +1868,7 @@ int open64(const char *pathname, int flags, ...) {
         goto fd_err;
     }
 
-    fprintf(stderr, "os_fd is: %d\n", os_fd);
+    logmsg(DEBUG, "os_fd is: %d\n", os_fd);
     /* set entry in fd table */
     fd_table[os_fd] = pfile;
 
@@ -1863,7 +1908,6 @@ int open64(const char *pathname, int flags, ...) {
         errno = ENXIO;
         goto reg_err;
     }
-    fprintf(stderr, "ib connection is setup.\n");
 
     /* switch server to polling mode */
     /* query_srv_poll(pfile->sctx); */
@@ -1884,6 +1928,7 @@ open_err:
 rights_err:
     free(pfile);
 file_alloc_err:
+    free(basename);
     return(-1);
 }
 
@@ -1901,6 +1946,7 @@ int close(int fd) {
 /*        fprintf(stderr, "destroying custom data structure (fd = %d).\n", fd);
         close_srv_conn(fd_table[fd]->sctx);
         free(fd_table[fd]);
+        if (fd_table[fd]->name != NULL) free(fd_table[fd]->name);
         fd_table[fd] = NULL;
         fprintf(stderr, "destruction of fd %d done, calling close(2).\n", fd);
     }*/

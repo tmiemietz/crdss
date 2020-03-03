@@ -22,7 +22,9 @@
 #include <unistd.h>                      /* UNIX standard calls             */
 #include <errno.h>                       /* information about errors        */
 #include <sys/types.h>
-#include <sys/stat.h>         
+#include <sys/stat.h>
+#include <sys/ioctl.h>                   /* get the block size of a device  */
+#include <linux/fs.h>                    /* for ioctl types                 */
 #include <fcntl.h>                       /* for bare open                   */
 #include <stdarg.h>                      /* for varargs                     */
 
@@ -44,32 +46,40 @@ struct crdss_bdev *stm_open_dev(char *path) {
     struct crdss_bdev *dev;
     int                 fd;
     char         *path_cpy;                 /* copy of path to store in dev */
+    unsigned int  block_sz;                 /* block size of device         */
 
     /* in order to obtain realistic values for testing with the kernel, use *
      * O_DIRECT when opening files                                          */
-    if ((fd = open(path, O_RDWR)) == -1) {
+    if ((fd = open(path, O_RDWR | O_DIRECT)) == -1) {
         logmsg(WARN, "Failed to open dev %s (%s), continuing...", path,
                strerror(errno));
         return(NULL);
     }
 
     dev      = malloc(sizeof(struct crdss_bdev));
-    path_cpy = malloc(strlen(path) + 1);
+    path_cpy = strdup(path);
 
     /* check for allocation error, free unused resources if needed  */
     if (dev == NULL || path_cpy == NULL) {
         logmsg(WARN, "stm_open_dev: memory allocation failed");
-        if (dev != NULL)
-            free(dev);
+        if (dev != NULL)      free(dev);
+        if (path_cpy != NULL) free(path_cpy);
 
         return(NULL);
     }
 
-    memcpy(path_cpy, path, strlen(path));
-    path_cpy[strlen(path)] = '\0';
+    if (ioctl(fd, BLKSSZGET, &block_sz) == -1) {
+        logmsg(ERROR, "Failed to query block size of device (%d).", errno);
+        free(path_cpy);
+        free(dev);
 
-    dev->path = path_cpy;
-    dev->fd   = fd;
+        return(NULL);
+    }
+    logmsg(DEBUG, "Block size of device is %u.", block_sz);
+
+    dev->path     = path_cpy;
+    dev->fd       = fd;
+    dev->block_sz = block_sz;
     pthread_mutex_init(&dev->meta_lck, NULL);       /* use default attrs    */
 
     return(dev);
@@ -77,16 +87,20 @@ struct crdss_bdev *stm_open_dev(char *path) {
 
 /* Detects the storage manager type of a device managed by crdss.           */
 int stm_detect_type(struct crdss_bdev *dev) {
-    uint32_t buffer;
+    /* buffer for writing vslice table (4096 B), use a buffer instead of    *   
+     * writing the fields separately in order to support direct I/O         */  
+    unsigned char table_buf[4096]                                   
+                    __attribute__ ((__aligned__(512)));    
 
-    if (pread(dev->fd, &buffer, sizeof(uint32_t), (off_t) 0) < 4) {
+    if (pread(dev->fd, table_buf, 4096, (off_t) 0) < 4) {
         logmsg(WARN, "Failed to read drive label");
         return(STM_TYPE_UNKNWN);
     }
     else {
         /* detect STM type and set proper function implementations          */
-        switch (buffer) {
+        switch (*((uint32_t *) table_buf)) {
             case STM_TYPE_STATIC:
+                logmsg(INFO, "Device %s has static vslice layout.", dev->path);
                 pthread_mutex_lock(&dev->meta_lck);
                 dev->ops.rd_vslctbl = sstm_rd_vslctbl;
                 dev->ops.mkvslc     = sstm_mkvslc;
@@ -121,6 +135,17 @@ int stm_init(struct crdss_bdev *dev, unsigned int type, ...) {
                 va_end(arglist);
                 return(-1);
             }
+
+            /* set the function implementation accordingly */
+            pthread_mutex_lock(&dev->meta_lck);
+            dev->ops.rd_vslctbl = sstm_rd_vslctbl;
+            dev->ops.mkvslc     = sstm_mkvslc;
+            dev->ops.rmvslc     = sstm_rmvslc;
+            dev->ops.alloc      = sstm_alloc;
+            dev->ops.release    = sstm_release;
+            dev->ops.translate  = sstm_translate;
+            dev->ops.info       = sstm_info;
+            pthread_mutex_unlock(&dev->meta_lck);
 
             /* if table was written successfully, device is in a sane state */
             dev->state = DEV_OK;

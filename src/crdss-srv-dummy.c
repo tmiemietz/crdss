@@ -733,6 +733,7 @@ static int handle_drvcap(struct handler *handler, unsigned char *par_id,
  *
  * Returns: An error code as defined in src/include/protocol.h
  */
+__attribute__ ((unused))
 static int handle_read(struct handler *handler, uint16_t didx, uint32_t sidx,
                        uint64_t addr, uint32_t len, uint64_t rdma_offs) {
     unsigned int i;
@@ -862,6 +863,7 @@ static int handle_read(struct handler *handler, uint16_t didx, uint32_t sidx,
  *
  * Returns: An error code as defined in src/include/protocol.h
  */
+__attribute__ ((unused))
 static int handle_write(struct handler *handler, uint16_t didx, uint32_t sidx,
                         uint64_t addr, uint32_t len, uint64_t rdma_offs) {
     unsigned int i;
@@ -1557,7 +1559,7 @@ static void *ib_worker(void *ctx) {
 
     struct crdss_srv_cap *new_cap;          /* pointer to new capability    */
 
-    uint8_t op_res;                         /* result of server operations  */
+    uint8_t op_res = 0;                     /* result of server operations  */
 
     unsigned char send_buf[MAX_MSG_LEN];    /* send buffer for ctrl messages*/
 
@@ -1745,16 +1747,18 @@ static void *ib_worker(void *ctx) {
                 logmsg(DEBUG, "Handler %lu: RDMA offset is %lu, remote addr "
                        "is %lu.", handler->tid, rdma_offs, 
                        handler->ibctx->remote_addr);
-
+                
+                /* skip actual I/O operation for dummy server */
+                /*
                 op_res = handle_read(handler, device_idx, slice_idx, saddr,
                                      length, rdma_offs);
 
                 if (op_res != R_SUCCESS) {
-                    /* send error message as an answer */
                     memcpy(send_buf, &op_res, sizeof(uint8_t));
                     post_msg_sr(handler->ibctx, send_buf, imm);
                 }
-
+                */
+    
                 /* data loaded, send RDMA request */
                 logmsg(DEBUG, "Handler %lu (IBW): Data of read loaded, "
                        "starting RDMA transfer.", handler->tid);
@@ -1795,11 +1799,11 @@ static void *ib_worker(void *ctx) {
                     break;
                 }
 
+                /*
                 op_res = handle_read(handler, device_idx, slice_idx, saddr,
                                      length, rdma_offs);
 
                 if (op_res != R_SUCCESS) {
-                    /* write error number to client-side doorbell */
                     logmsg(ERROR, "Handler %lu: Read request failed.", 
                            handler->tid);
                     memcpy((unsigned char *) handler->data_buf + poll_field, 
@@ -1814,6 +1818,7 @@ static void *ib_worker(void *ctx) {
                     post_msg_rr(handler->ibctx, msg, 1);
                     break;
                 }
+                */
 
                 if (init_rdma_transfer(handler->ibctx, 
                     handler->data_buf + rdma_offs, 
@@ -1852,8 +1857,10 @@ static void *ib_worker(void *ctx) {
                 rdma_offs  = be64toh(*((uint64_t *) (msg + 19))) - 
                              (uint64_t) handler->ibctx->remote_addr;
 
+                /*
                 op_res = handle_write(handler, device_idx, slice_idx, saddr,
                                       length, rdma_offs);
+                */
 
                 /* regardless of the outcome of the operation, send the     *
                  * status and the rdma offset (for identification on clt    *
@@ -1881,8 +1888,10 @@ static void *ib_worker(void *ctx) {
                 rdma_offs  = be64toh(*((uint64_t *) (msg + 19))) - 
                              (uint64_t) handler->ibctx->remote_addr;
 
+                /*
                 op_res = handle_write(handler, device_idx, slice_idx, saddr,
                                       length, rdma_offs);
+                */
 
                 /* rdma offset now becomes offset for poll field */
                 poll_field = be64toh(*((uint64_t *) (msg + 27))) - 

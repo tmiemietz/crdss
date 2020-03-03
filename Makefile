@@ -10,7 +10,7 @@ OBJDIR := obj
 INCDIR := src/include
 
 TGTDIR := bin
-TGTS   := crdss-srv crdss-capmgr libcrdss testclt
+TGTS   := crdss-srv crdss-capmgr libcrdss testclt crdss-srv-dummy
 
 LIBS   := -lpthread -lsodium -libverbs -ldl
 
@@ -26,6 +26,10 @@ TGTOBJS := $(addprefix $(OBJDIR)/, $(addsuffix .o, $(TGTS)))
 all: $(TGTS)
 
 crdss-srv: obj/crdss-srv.o $(filter-out $(TGTOBJS), $(OBJECTS))
+	@echo "Linking $@..."
+	$(CC) -pedantic -o $(TGTDIR)/$@ $^ $(LIBS)
+
+crdss-srv-dummy: obj/crdss-srv-dummy.o $(filter-out $(TGTOBJS), $(OBJECTS))
 	@echo "Linking $@..."
 	$(CC) -pedantic -o $(TGTDIR)/$@ $^ $(LIBS)
 
