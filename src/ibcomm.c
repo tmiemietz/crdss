@@ -653,13 +653,15 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
 
         /* suppress successful send operations */
         if (cqe.opcode == IBV_WC_SEND && cqe.status == IBV_WC_SUCCESS) {
+            /*
             if (cqe.wc_flags & IBV_WC_WITH_IMM) {
                 logmsg(DEBUG, "Skipping send request (id %lu, imm %u)", 
                        cqe.wr_id, cqe.imm_data);
             }
             else
                 logmsg(DEBUG, "Skipping send request.");
-            
+            */
+
             poll_res = 0;
         }
 
@@ -743,12 +745,14 @@ int poll_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
 
         /* suppress successful send operations */
         if (cqe.opcode == IBV_WC_SEND && cqe.status == IBV_WC_SUCCESS) {
+            /*
             if (cqe.wc_flags & IBV_WC_WITH_IMM) {
                 logmsg(DEBUG, "Skipping send request (id: %lu, imm %u)", 
                        cqe.wr_id, cqe.imm_data);
             }
             else
                 logmsg(DEBUG, "Skipping send request.");
+            */
 
             poll_res = 0;
         }

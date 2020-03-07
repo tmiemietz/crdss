@@ -274,7 +274,7 @@ static void *completion_worker(void *ctx) {
     struct slist *lptr;                 /* ptr for list iteration           */
 
     while (1) {
-        ret = get_next_ibmsg(&sctx->ibctx, &msg, &imm);
+        ret = poll_next_ibmsg(&sctx->ibctx, &msg, &imm);
         logmsg(DEBUG, "comp worker: got new message (imm = %u)!", imm);
 
         pthread_mutex_lock(&sctx->wait_lck);
@@ -888,18 +888,15 @@ int reg_cap(struct crdss_srv_ctx *sctx, unsigned char *capid) {
         msg_buf[0] = MTYPE_REGCAP;
         memcpy(msg_buf + 1, capid, CAP_ID_LEN);
 
-        logmsg(INFO, "reg_cap: sending request to the server.");
         if (post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid) != 0) {
             /* failed to trigger IB send op. */
             return(1);
         }
-
-        logmsg(INFO, "reg_cap: waiting for answer of server.");
+        
         if (wait_for_ibmsg(work_ctx, work_ctx->tid) != 0) {
             /* receive op failed */
             return(1);
         }
-        logmsg(INFO, "reg_cap: received answer from server.");
 
         op_res = (uint8_t) work_ctx->msg[0];
         /* repost receive request */
@@ -1919,7 +1916,7 @@ int open64(const char *pathname, int flags, ...) {
     }
 
     /* switch server to polling mode */
-    /* query_srv_poll(pfile->sctx); */
+    query_srv_poll(pfile->sctx);
 
     // pthread_mutex_unlock(&table_lck);
     return(os_fd);
