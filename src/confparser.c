@@ -1074,6 +1074,7 @@ int check_libcfg(struct clt_lib_cfg *cfg) {
 int init_ccap_from_path(char *path, struct crdss_clt_cap *ccap) {
     int field = 0;                              /* position in path         */
 
+    char *path_cpy;                             /* copy for manipulation    */
     char *tok;                                  /* fields for strtok_r      */
     char *pos;
 
@@ -1081,15 +1082,21 @@ int init_ccap_from_path(char *path, struct crdss_clt_cap *ccap) {
     if (strncmp(path, "crdss", 5) != 0)
         return(1);
 
+    path_cpy = strdup(path);
+    if (path_cpy == NULL)
+        return(1);
+
     memset(ccap, 0, sizeof(struct crdss_clt_cap));
     ccap->srv.sin_family = AF_INET;
-    for (tok = strtok_r(path, "-", &pos); tok != NULL;
+    for (tok = strtok_r(path_cpy, "-", &pos); tok != NULL;
          tok = strtok_r(NULL, "-", &pos)) {
        
         switch (field) {
             case 1:
-                if (inet_pton(AF_INET, tok, &ccap->srv.sin_addr) != 1)
+                if (inet_pton(AF_INET, tok, &ccap->srv.sin_addr) != 1) {
+                    free(path_cpy);
                     return(1);
+                }
 
                 break;
             case 2:
@@ -1104,6 +1111,8 @@ int init_ccap_from_path(char *path, struct crdss_clt_cap *ccap) {
 
         field++;
     }
+
+    free(path_cpy);
 
     /* check if all information required was present */
     if (field < 3)

@@ -72,7 +72,7 @@ pthread_t cap_thread;
 
 
 void *cap_worker(void *ptr) {
-    struct ibv_wc cqe[5];
+    /* struct ibv_wc cqe[5]; */
     
     (void) ptr;
 
@@ -83,21 +83,21 @@ void *cap_worker(void *ptr) {
             fprintf(stderr, "cap_worker: Failed to register cap.\n");
         }
    
-        fprintf(stderr, "reged cap.\n");
         usleep(10);
 
         if (delete_rdom(sctx, cap2.rev_dom) != 0) {
             fprintf(stderr, "cap_worker: Failed to delete cap.\n");
         }
-        fprintf(stderr, "deleted cap.\n");
 
         if (request_new_cap(&cap2) != 0) {
             fprintf(stderr, "cap_worker: Failed to recreate cap.\n");
         }
 
-        ibv_poll_cq(sctx->ibctx.cq, 5, cqe);
-        fprintf(stderr, "Completed one loop.\n");
+        fprintf(stderr, "cap_worker: finished one loop.\n");
+        /* ibv_poll_cq(sctx->ibctx.cq, 5, cqe); */
     }
+
+    return(NULL);
 }
 
 /****************************************************************************
@@ -244,7 +244,11 @@ int main(int argc, char **argv) {
             return(1);
         }
 
-        ibv_poll_cq(sctx->ibctx.cq, 5, cqe);
+        if (cap_flag == 0) {
+            /* if there is a cap worker which uses the completion means of  *
+             * the CRDSS library, no separate completion handling is needed */
+            ibv_poll_cq(sctx->ibctx.cq, 5, cqe);
+        }
         file_offset += GAPSIZE;
     }
     clock_gettime(CLOCK_MONOTONIC, &end);

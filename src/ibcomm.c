@@ -583,6 +583,9 @@ int destroy_ibctx(struct ib_ctx *ibctx) {
         return(1);
     }
 
+    /* acknowledge all outstanding events to prevent teardown op from blocking*/
+    ibv_ack_cq_events(ibctx->cq, ibctx->msg_cnt * 2);
+
     if (ibctx->qp != NULL && ibv_destroy_qp(ibctx->qp) != 0) {
         logmsg(ERROR, "Failed to destrox QP.");
         return(1);
@@ -625,6 +628,7 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
     struct ibv_wc cqe;                      /* completion entry             */
 
     while (poll_res == 0) {
+        logmsg(DEBUG, "Waiting for IB message.");
         if (ibv_get_cq_event(ibctx->cchannel, &cq, &compl_ctx) == -1) {
             logmsg(ERROR, "Failed to get next completion event notification.");
             return(-1);
@@ -635,9 +639,6 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
             logmsg(ERROR, "CChannel delivered event from wrong CQ.");
             return(-1);
         }
-
-        /* acknowledge the event read */
-        ibv_ack_cq_events(ibctx->cq, 1);
     
         if (ibv_req_notify_cq(ibctx->cq, 0) == -1) {
             logmsg(ERROR, "Failed to rearm notification mechanism of CQ.");
@@ -648,19 +649,20 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
         poll_res = ibv_poll_cq(ibctx->cq, 1, &cqe);
         if (poll_res < 0) {
             logmsg(ERROR, "Could not read completion event from CQ.");
+            ibv_ack_cq_events(ibctx->cq, 1);
             return(-1);
         }
 
         /* suppress successful send operations */
         if (cqe.opcode == IBV_WC_SEND && cqe.status == IBV_WC_SUCCESS) {
-            /*
+            
             if (cqe.wc_flags & IBV_WC_WITH_IMM) {
                 logmsg(DEBUG, "Skipping send request (id %lu, imm %u)", 
                        cqe.wr_id, cqe.imm_data);
             }
             else
                 logmsg(DEBUG, "Skipping send request.");
-            */
+           
 
             poll_res = 0;
         }
@@ -669,6 +671,9 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
             /* issuing thread requested to ignore this CQE on success */
             poll_res = 0;
         }
+
+        /* acknowledge the event read */
+        ibv_ack_cq_events(ibctx->cq, 1);
     }
 
     if (cqe.status != IBV_WC_SUCCESS) {

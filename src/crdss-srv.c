@@ -603,7 +603,6 @@ static int handle_rmdom(struct handler *handler, uint32_t rdom_id) {
 
         /* new_node will be used as the root node for deletion  */
         if (rdn->dom_key == rdom_id) {
-            logmsg(INFO, "rmdom: found matching rdom.");
             new_node = rdn;
             break;
         }
@@ -1279,7 +1278,7 @@ static void handle_capmgr(struct handler *handler) {
                 send(handler->sock, &new_cap->id, CAP_ID_LEN, 0);
                 break;
             case MTYPE_MKCAP2:
-                logmsg(INFO, "Handler %lu: Handling MKCAP2.", handler->tid);
+                logmsg(DEBUG, "Handler %lu: Handling MKCAP2.", handler->tid);
                 /* create a new cap from scratch. this cap will be member of *
                  * a new revocation domain                                   */
                 if (read_cap_from_sock(handler->sock, &device_idx, &slice_idx,
@@ -1635,25 +1634,33 @@ static void *ib_worker(void *ctx) {
         switch (msg_type) {
             case MTYPE_REGCAP:
                 /* register cap with this handler thread                    */
-                logmsg(INFO, "Handler %lu (IBW): Handling REGCAP request.", 
+                logmsg(DEBUG, "Handler %lu (IBW): Handling REGCAP request.", 
                        handler->tid);
                     
                 /* IB path, cap ID has one byte offset */
                 op_res = handle_regcap(handler, msg + 1);
 
                 if (op_res == R_SUCCESS) {
-                    logmsg(INFO, "Handler %lu (IBW): Registered new cap.", 
+                    logmsg(DEBUG, "Handler %lu (IBW): Registered new cap.", 
                            handler->tid);
                 }
                 else {
-                    logmsg(INFO, "Handler %lu (IBW): Cap registration failed "
+                    logmsg(DEBUG, "Handler %lu (IBW): Cap registration failed "
                            "(%u).", handler->tid, op_res);
                 }
 
                 /* send a status answer to the client (via IB message)      */
                 memset(send_buf, 0, MAX_MSG_LEN);
                 memcpy(send_buf, &op_res, sizeof(uint8_t));
-                post_msg_sr(handler->ibctx, send_buf, imm);
+                op_res = post_msg_sr(handler->ibctx, send_buf, imm);
+                if (op_res != 0) {
+                    logmsg(WARN, "Handler %lu (IBW): Failed to sent reply %u.",
+                           handler->tid, imm);
+                }
+                else {
+                    logmsg(DEBUG, "Handler %lu (IBW): Sent answer to client "
+                           "%u.", handler->tid, imm);
+                }
 
                 /* requeue receive request */
                 post_msg_rr(handler->ibctx, msg, 1);
@@ -1762,7 +1769,7 @@ static void *ib_worker(void *ctx) {
                  * list, destroys the rdoms and renders handler's local     *
                  * copies of caps invalid                                   */
                 rdom_id = ntohl(*((uint32_t *) (msg + 1)));
-                logmsg(INFO, "Handler %lu: Client requests deletion of domain "
+                logmsg(DEBUG, "Handler %lu: Client requests deletion of domain "
                        "%u.", handler->tid, rdom_id);
 
                 op_res = handle_rmdom(handler, rdom_id);
@@ -1771,13 +1778,21 @@ static void *ib_worker(void *ctx) {
                            handler->tid, rdom_id);
                 }
                 else {
-                    logmsg(INFO, "Handler %lu: Deleted domain %u.", 
+                    logmsg(DEBUG, "Handler %lu: Deleted domain %u.", 
                            handler->tid, rdom_id);
                 }
 
                 memset(send_buf, 0, MAX_MSG_LEN);
                 memcpy(send_buf, &op_res, sizeof(uint8_t));
-                post_msg_sr(handler->ibctx, send_buf, imm);
+                op_res = post_msg_sr(handler->ibctx, send_buf, imm);
+                if (op_res != 0) {
+                    logmsg(WARN, "Handler %lu (IBW): Failed to sent reply.",
+                           handler->tid);
+                }
+                else {
+                    logmsg(DEBUG, "Handler %lu (IBW): Sent answer to client.",
+                           handler->tid);
+                }
                         
                 /* requeue receive request */
                 post_msg_rr(handler->ibctx, msg, 1);
@@ -1973,10 +1988,11 @@ static void *ib_worker(void *ctx) {
                     (uint64_t) handler->ibctx->remote_addr + imm) != 0) {
                     logmsg(ERROR, "Handler %lu: Failed to write poll field "
                            "for fast read completion.", handler->tid);
+                } 
+                else {
+                    logmsg(DEBUG, "Handler %lu: doorbell address written.",
+                           handler->tid);
                 }
-
-                logmsg(DEBUG, "Handler %lu: doorbell address written.",
-                       handler->tid);
 
                 break;
             case MTYPE_CPOLL:

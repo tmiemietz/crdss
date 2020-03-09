@@ -498,11 +498,11 @@ static int register_cap_with_dom(struct handler *handler,
  * Returns: R_SUCCESS on succes or a crdss error number on error.
  */
 static int handle_regcap(struct handler *handler, unsigned char *id_buf) {
-    struct slist *lptr;                     /* ptr for list iteration       */
+    struct slist *lptr = NULL;              /* ptr for list iteration       */
     struct crdss_srv_cap *new_cap;          /* ptr to new local cap copy    */
     struct crdss_srv_cap *par_cap;          /* parent cap of requested cap  */
 
-    new_cap = malloc(sizeof(struct crdss_srv_cap));
+    new_cap = calloc(1, sizeof(struct crdss_srv_cap));
     if (new_cap == NULL) {
         logmsg(ERROR, "Handler %lu: Failed to allocate new cap.", handler->tid);
         return(R_FAILURE);
@@ -511,14 +511,26 @@ static int handle_regcap(struct handler *handler, unsigned char *id_buf) {
     /* go through the global cap list and check if a cap with the ID given  *
      * has been registered                                                  */
     pthread_mutex_lock(&cap_lck);
+    logmsg(DEBUG, "reg_cap: Acquired cap lock.");
 
     /* check if cap is globally available                                   */
+    logmsg(DEBUG, "reg_cap: global cap list len is %u.", 
+           slist_length(cap_list));
     for (lptr = cap_list; lptr != NULL; lptr = lptr->next) {
         par_cap = (struct crdss_srv_cap *) lptr->data;
 
         if (memcmp(par_cap->id, id_buf, CAP_ID_LEN) == 0) {
             /* make a local copy of the global cap */
-            memcpy(new_cap, par_cap, sizeof(struct crdss_srv_cap));
+            new_cap->dev_idx    = par_cap->dev_idx;
+            new_cap->vslc_idx   = par_cap->vslc_idx;
+            new_cap->start_addr = par_cap->start_addr;
+            new_cap->end_addr   = par_cap->end_addr;
+
+            new_cap->rights  = par_cap->rights;
+            new_cap->rev_dom = par_cap->rev_dom;
+            memcpy(new_cap->id, par_cap->id, CAP_ID_LEN);
+
+            new_cap->valid   = 1;
             pthread_mutex_init(&new_cap->valid_lck, NULL);
             break;
         }
@@ -532,7 +544,9 @@ static int handle_regcap(struct handler *handler, unsigned char *id_buf) {
         return(R_INVAL);
     }
 
+    logmsg(DEBUG, "reg_cap: locking local cap list.");
     pthread_rwlock_wrlock(&handler->cap_lck);
+    logmsg(DEBUG, "reg_cap: acquired lock for local cap list.");
 
     /* first try insertion into handler-local cap list                      */
     if (slist_insert(&handler->caps, new_cap)) {
@@ -575,11 +589,11 @@ static int handle_regcap(struct handler *handler, unsigned char *id_buf) {
  * Returns: One of the error numbers defined in include/protocol.h.
  */
 static int handle_rmdom(struct handler *handler, uint32_t rdom_id) {
-    struct slist *lptr      = NULL;     /* ptrs for iterating over lists    */
+    struct slist *lptr      = NULL;        /* ptrs for iterating over lists  */
     struct slist *lptr2     = NULL;
-    struct slist *inv_rdoms = NULL;     /* contains all doomed rdom nodes   */
+    struct slist *inv_rdoms = NULL;        /* contains all doomed rdom nodes */
 
-    struct rev_dom_node *new_node;      /* ptr to root rdom node to delete  */
+    struct rev_dom_node *new_node = NULL;  /* ptr to root rdom node to delete*/
 
     pthread_mutex_lock(&cap_lck);
                 
@@ -641,7 +655,10 @@ static int handle_rmdom(struct handler *handler, uint32_t rdom_id) {
             }
         }
     }
-                
+           
+    if (slist_insert(&free_dom_ids, (void *) (uint64_t) rdom_id) != 0)
+        logmsg(WARN, "Failed to insert rdom ID in free list.");
+
     pthread_mutex_unlock(&cap_lck);
 
     /* discard invalid rdoms and send answer */
@@ -681,8 +698,8 @@ static int handle_drvcap(struct handler *handler, unsigned char *par_id,
     struct crdss_srv_cap *new_cap;          /* new global cap               */
     struct crdss_srv_cap *new_cap_cpy;      /* handler-local copy of new_cap*/
 
-    new_cap     = malloc(sizeof(struct crdss_srv_cap));
-    new_cap_cpy = malloc(sizeof(struct crdss_srv_cap));
+    new_cap     = calloc(1, sizeof(struct crdss_srv_cap));
+    new_cap_cpy = calloc(1, sizeof(struct crdss_srv_cap));
     if (new_cap == NULL || new_cap_cpy == NULL) {
         logmsg(ERROR, "Handler %lu: Failed to allocate memory for capability.",
                handler->tid);
@@ -704,7 +721,13 @@ static int handle_drvcap(struct handler *handler, unsigned char *par_id,
     pthread_mutex_init(&new_cap->valid_lck, NULL);
     
     /* complete the cap copy for our local list */
-    memcpy(new_cap_cpy, new_cap, sizeof(struct crdss_srv_cap));
+    new_cap_cpy->dev_idx    = didx;
+    new_cap_cpy->vslc_idx   = sidx;
+    new_cap_cpy->start_addr = saddr;
+    new_cap_cpy->end_addr   = eaddr;
+    new_cap_cpy->rights     = rights;
+
+    new_cap->valid = 1;
     pthread_mutex_init(&new_cap_cpy->valid_lck, NULL);
 
     /* check if the requested revocation domain exists and insert the cap in*
@@ -757,6 +780,7 @@ static int handle_read(struct handler *handler, uint16_t didx, uint32_t sidx,
     for (lptr = handler->caps; lptr != NULL;) {
         struct crdss_srv_cap *cap = (struct crdss_srv_cap *) lptr->data;
 
+        logmsg(DEBUG, "handle_read: acquiring valid lock.");
         pthread_mutex_lock(&cap->valid_lck);
         if (cap->valid == 0) {
             /* cap became void, destruction is not scheduled; destroy it    */
@@ -764,20 +788,23 @@ static int handle_read(struct handler *handler, uint16_t didx, uint32_t sidx,
             pthread_mutex_unlock(&cap->valid_lck);
             pthread_rwlock_unlock(&handler->cap_lck);
 
-            logmsg(DEBUG, "Handler %lu: Removing expired capability.");
+            logmsg(DEBUG, "Handler %lu: Removing expired capability.",
+                   handler->tid);
             pthread_rwlock_wrlock(&handler->cap_lck);
+            logmsg(DEBUG, "handle_read: acquired local cap list lock.");
             pthread_mutex_destroy(&cap->valid_lck);
             free(cap);
 
             /* restart iteration since other threads may have already       *
              * deleted the successor of cap                                 */
-            lptr = handler->caps;
             handler->caps = slist_remove(handler->caps, cap);
+            lptr = handler->caps;
 
+            logmsg(DEBUG, "handle_read: relocking lists after deletion.");
             /* return writer's lock and take reader's lock again (perf.)    */
             pthread_rwlock_unlock(&handler->cap_lck);
             pthread_rwlock_rdlock(&handler->cap_lck);
-
+    
             continue;
         }
 
@@ -891,15 +918,16 @@ static int handle_write(struct handler *handler, uint16_t didx, uint32_t sidx,
             pthread_mutex_unlock(&cap->valid_lck);
             pthread_rwlock_unlock(&handler->cap_lck);
 
-            logmsg(DEBUG, "Handler %lu: Removing expired capability.");
+            logmsg(DEBUG, "Handler %lu: Removing expired capability.",
+                   handler->tid);
             pthread_rwlock_wrlock(&handler->cap_lck);
             pthread_mutex_destroy(&cap->valid_lck);
             free(cap);
 
             /* restart iteration since other threads may have already       *
              * deleted the successor of cap                                 */
-            lptr = handler->caps;
             handler->caps = slist_remove(handler->caps, cap);
+            lptr = handler->caps;
 
             /* return writer's lock and take reader's lock again (perf.)    */
             pthread_rwlock_unlock(&handler->cap_lck);
@@ -1000,9 +1028,9 @@ static int handle_drvcap2(struct handler *handler, unsigned char *par_id,
     struct slist *lptr;                     /* list iteration pointer       */
 
     /* firstly, try allocation of required data structures */
-    new_cap     = malloc(sizeof(struct crdss_srv_cap));
-    new_cap_cpy = malloc(sizeof(struct crdss_srv_cap));
-    new_node    = malloc(sizeof(struct rev_dom_node));
+    new_cap     = calloc(1, sizeof(struct crdss_srv_cap));
+    new_cap_cpy = calloc(1, sizeof(struct crdss_srv_cap));
+    new_node    = calloc(1, sizeof(struct rev_dom_node));
     if (new_cap_cpy == NULL || new_cap_cpy == NULL || new_node == NULL) {
         logmsg(ERROR, "Failed to allocate memory for capability.");
         
@@ -1024,7 +1052,13 @@ static int handle_drvcap2(struct handler *handler, unsigned char *par_id,
     pthread_mutex_init(&new_cap->valid_lck, NULL);
     
     /* complete the cap copy for our local list                 */
-    memcpy(new_cap_cpy, new_cap, sizeof(struct crdss_srv_cap));
+    new_cap_cpy->dev_idx    = didx;
+    new_cap_cpy->vslc_idx   = sidx;
+    new_cap_cpy->start_addr = saddr;
+    new_cap_cpy->end_addr   = eaddr;
+    new_cap_cpy->rights     = rights;
+
+    new_cap_cpy->valid = 1;
     pthread_mutex_init(&new_cap_cpy->valid_lck, NULL);
 
     /* check if the requested revocation domain exists and insert the cap in*
@@ -1218,7 +1252,13 @@ static void handle_capmgr(struct handler *handler) {
                 pthread_mutex_init(&new_cap->valid_lck, NULL);
     
                 /* complete the cap copy for our local list                 */
-                memcpy(new_cap_cpy, new_cap, sizeof(struct crdss_srv_cap));
+                new_cap_cpy->dev_idx    = device_idx;
+                new_cap_cpy->vslc_idx   = slice_idx;
+                new_cap_cpy->start_addr = saddr;
+                new_cap_cpy->end_addr   = eaddr;
+                new_cap_cpy->rights     = cap_rights;
+
+                new_cap_cpy->valid = 1;
                 pthread_mutex_init(&new_cap_cpy->valid_lck, NULL);
 
                 /* check if the requested revocation domain exists and      *
@@ -1261,9 +1301,9 @@ static void handle_capmgr(struct handler *handler) {
 
                 /* since the client followed the protocol so far, from now on*
                  * he deserves an answer to his requests                     */
-                new_cap     = malloc(sizeof(struct crdss_srv_cap));
-                new_cap_cpy = malloc(sizeof(struct crdss_srv_cap));
-                new_node    = malloc(sizeof(struct rev_dom_node));
+                new_cap     = calloc(1, sizeof(struct crdss_srv_cap));
+                new_cap_cpy = calloc(1, sizeof(struct crdss_srv_cap));
+                new_node    = calloc(1, sizeof(struct rev_dom_node));
                 if (new_cap_cpy == NULL || new_cap_cpy == NULL || 
                     new_node == NULL) {
                     
@@ -1288,7 +1328,13 @@ static void handle_capmgr(struct handler *handler) {
                 pthread_mutex_init(&new_cap->valid_lck, NULL);
     
                 /* complete the cap copy for our local list                 */
-                memcpy(new_cap_cpy, new_cap, sizeof(struct crdss_srv_cap));
+                new_cap_cpy->dev_idx    = device_idx;
+                new_cap_cpy->vslc_idx   = slice_idx;
+                new_cap_cpy->start_addr = saddr;
+                new_cap_cpy->end_addr   = eaddr;
+                new_cap_cpy->rights     = cap_rights;
+
+                new_cap_cpy->valid = 1;
                 pthread_mutex_init(&new_cap_cpy->valid_lck, NULL);
 
                 /* check if the requested revocation domain exists and      *
@@ -1597,18 +1643,26 @@ static void *ib_worker(void *ctx) {
                 op_res = handle_regcap(handler, msg + 1);
 
                 if (op_res == R_SUCCESS) {
-                    logmsg(INFO, "Handler %lu: Registered new cap.", 
+                    logmsg(DEBUG, "Handler %lu (IBW): Registered new cap.", 
                            handler->tid);
                 }
                 else {
-                    logmsg(INFO, "Handler %lu: Cap registration failed (%u).",
-                           handler->tid, op_res);
+                    logmsg(DEBUG, "Handler %lu (IBW): Cap registration failed "
+                           "(%u).", handler->tid, op_res);
                 }
 
                 /* send a status answer to the client (via IB message)      */
                 memset(send_buf, 0, MAX_MSG_LEN);
                 memcpy(send_buf, &op_res, sizeof(uint8_t));
-                post_msg_sr(handler->ibctx, send_buf, imm);
+                op_res = post_msg_sr(handler->ibctx, send_buf, imm);
+                if (op_res != 0) {
+                    logmsg(WARN, "Handler %lu (IBW): Failed to sent reply %u.",
+                           handler->tid, imm);
+                }
+                else {
+                    logmsg(DEBUG, "Handler %lu (IBW): Sent answer to client "
+                           "%u.", handler->tid, imm);
+                }
 
                 /* requeue receive request */
                 post_msg_rr(handler->ibctx, msg, 1);
@@ -1717,16 +1771,30 @@ static void *ib_worker(void *ctx) {
                  * list, destroys the rdoms and renders handler's local     *
                  * copies of caps invalid                                   */
                 rdom_id = ntohl(*((uint32_t *) (msg + 1)));
-                
+                logmsg(DEBUG, "Handler %lu: Client requests deletion of domain "
+                       "%u.", handler->tid, rdom_id);
+
                 op_res = handle_rmdom(handler, rdom_id);
                 if (op_res != R_SUCCESS) {
                     logmsg(WARN, "Handler %lu: Failed to revoke domain %u.",
                            handler->tid, rdom_id);
                 }
+                else {
+                    logmsg(DEBUG, "Handler %lu: Deleted domain %u.", 
+                           handler->tid, rdom_id);
+                }
 
                 memset(send_buf, 0, MAX_MSG_LEN);
                 memcpy(send_buf, &op_res, sizeof(uint8_t));
-                post_msg_sr(handler->ibctx, send_buf, imm);
+                op_res = post_msg_sr(handler->ibctx, send_buf, imm);
+                if (op_res != 0) {
+                    logmsg(WARN, "Handler %lu (IBW): Failed to sent reply.",
+                           handler->tid);
+                }
+                else {
+                    logmsg(DEBUG, "Handler %lu (IBW): Sent answer to client.",
+                           handler->tid);
+                }
                         
                 /* requeue receive request */
                 post_msg_rr(handler->ibctx, msg, 1);
@@ -1748,17 +1816,17 @@ static void *ib_worker(void *ctx) {
                        "is %lu.", handler->tid, rdma_offs, 
                        handler->ibctx->remote_addr);
                 
-                /* skip actual I/O operation for dummy server */
                 /*
                 op_res = handle_read(handler, device_idx, slice_idx, saddr,
                                      length, rdma_offs);
+                */
 
                 if (op_res != R_SUCCESS) {
+                    /* send error message as an answer */
                     memcpy(send_buf, &op_res, sizeof(uint8_t));
                     post_msg_sr(handler->ibctx, send_buf, imm);
                 }
-                */
-    
+
                 /* data loaded, send RDMA request */
                 logmsg(DEBUG, "Handler %lu (IBW): Data of read loaded, "
                        "starting RDMA transfer.", handler->tid);
@@ -1802,8 +1870,10 @@ static void *ib_worker(void *ctx) {
                 /*
                 op_res = handle_read(handler, device_idx, slice_idx, saddr,
                                      length, rdma_offs);
+                */
 
                 if (op_res != R_SUCCESS) {
+                    /* write error number to client-side doorbell */
                     logmsg(ERROR, "Handler %lu: Read request failed.", 
                            handler->tid);
                     memcpy((unsigned char *) handler->data_buf + poll_field, 
@@ -1818,7 +1888,6 @@ static void *ib_worker(void *ctx) {
                     post_msg_rr(handler->ibctx, msg, 1);
                     break;
                 }
-                */
 
                 if (init_rdma_transfer(handler->ibctx, 
                     handler->data_buf + rdma_offs, 
@@ -2832,9 +2901,9 @@ int main(int argc, char **argv) {
     /* set log path. if logpath == NULL, stderr is used since the server    *
      * won't run as a daemon in this case (see error conditions above)      */
     if (logpath != NULL)
-        init_logger(logpath, INFO);
+        init_logger(logpath, server_conf.loglevel);
     else
-        init_logger("/dev/stderr", INFO);        
+        init_logger("/dev/stderr", server_conf.loglevel);        
 
     /* logpath-related memory is no longer needed, free it immediately      */
     if (logdir != NULL)
