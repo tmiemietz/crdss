@@ -2586,7 +2586,7 @@ static void *handle_client(void *args) {
     }
 
 end:
-    logmsg(INFO, "Handler %lu: Starting teardown operatons.", this->tid);
+    logmsg(INFO, "Handler %lu: Starting teardown operations.", this->tid);
     
     close_ib_conn(this);
     close(this->sock);

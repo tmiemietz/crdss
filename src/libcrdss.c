@@ -138,7 +138,7 @@ static int (*libc_open64)(const char *, int, ...)                 = NULL;
  * changing the parameters of init_logger.
  */
 static void setup_logger(void) {
-    init_logger("/dev/stderr", DEBUG);
+    init_logger("/dev/stderr", INFO);
 }
 
 /****************************************************************************
@@ -1299,9 +1299,13 @@ int fast_write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         *pf_ptr = R_UNDEF;
 
         /* transfer data, afterwards send the actual request */
-        if (init_rdma_transfer(&sctx->ibctx, (unsigned char *) rdma_addr,
-                               (unsigned char *) rdma_rem_addr, cur_len, 
-                               0, 0, 0) != 0) {
+        while ((ret = init_rdma_transfer(&sctx->ibctx, 
+                (unsigned char *) rdma_addr, (unsigned char *) rdma_rem_addr, 
+                cur_len, 0, 0, 0)) == 12) {
+            usleep(LIBCRDSS_POLL_INT);
+        }
+
+        if (ret != 0) {
             return(R_FAILURE);
         }
 
@@ -1827,7 +1831,7 @@ int open64(const char *pathname, int flags, ...) {
         return(ret);
     }
 
-    fprintf(stderr, "Entering custom part of open64 (%s)!\n", basename);
+    /* fprintf(stderr, "Entering custom part of open64 (%s)!\n", basename); */
 
     /* lock fd table to avoid race conditions */
     pthread_mutex_lock(&table_lck);
@@ -1837,7 +1841,7 @@ int open64(const char *pathname, int flags, ...) {
     for (i = 0; i < LIBCRDSS_MAX_FD; i++) {
         if (fd_table[i] != NULL && strcmp(basename, fd_table[i]->name) == 0) {
             /* file name is already opened */
-            fprintf(stderr, "Reusing existing CRDSS session.\n");
+            /* fprintf(stderr, "Reusing existing CRDSS session.\n"); */
             free(basename);
             fd_table[i]->ref_cnt = fd_table[i]->ref_cnt + 1;
             pthread_mutex_unlock(&table_lck);

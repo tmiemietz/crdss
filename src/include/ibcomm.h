@@ -66,6 +66,7 @@ struct ib_ctx {
     struct ibv_cq *cq;                      /* completion queue of this QP  */
 
     struct ibv_comp_channel *cchannel;      /* for non-polling completion   */
+    pthread_mutex_t notify_lck;             /* lock for blocking notify     */
 
     uint32_t msg_cnt;                       /* no. of receive requests with *
                                              * a size of MAX_MSG_LEN that   *

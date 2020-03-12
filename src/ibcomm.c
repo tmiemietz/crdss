@@ -147,6 +147,11 @@ int init_clt_qp(struct ib_ctx *ibctx, uint64_t guid, unsigned char **msgbuf,
     struct ibv_qp_init_attr iattr;      /* attributes for initializing a    *
                                          * queue pair                       */
 
+    if (pthread_mutex_init(&ibctx->notify_lck, NULL) != 0) {
+        logmsg(ERROR, "Failed to initialize notification lock.");
+        return(1);
+    }
+
     /* first of all, allocate the message buffers. If this fails, we don't  *
      * even have to bother with any further actions                         */
     /* memory is allocated only for receive / completion messages since     *
@@ -611,6 +616,8 @@ int destroy_ibctx(struct ib_ctx *ibctx) {
     if (ibctx->pdom != NULL)    ibv_dealloc_pd(ibctx->pdom);
     if (ibctx->dev_ctx != NULL) ibv_close_device(ibctx->dev_ctx);
 
+    pthread_mutex_destroy(&ibctx->notify_lck);
+
     return(0);
 }
 
@@ -628,33 +635,18 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
     struct ibv_wc cqe;                      /* completion entry             */
 
     while (poll_res == 0) {
-        logmsg(DEBUG, "Waiting for IB message.");
-        if (ibv_get_cq_event(ibctx->cchannel, &cq, &compl_ctx) == -1) {
-            logmsg(ERROR, "Failed to get next completion event notification.");
-            return(-1);
-        }
-    
-        /* this should be always false, but check for completeness          */
-        if (cq != ibctx->cq) {
-            logmsg(ERROR, "CChannel delivered event from wrong CQ.");
-            return(-1);
-        }
-    
-        if (ibv_req_notify_cq(ibctx->cq, 0) == -1) {
-            logmsg(ERROR, "Failed to rearm notification mechanism of CQ.");
-            return(-1);
-        }
+        memset(&cqe, 0, sizeof(struct ibv_wc));
 
         /* get the actual event from the CQ */
         poll_res = ibv_poll_cq(ibctx->cq, 1, &cqe);
         if (poll_res < 0) {
             logmsg(ERROR, "Could not read completion event from CQ.");
-            ibv_ack_cq_events(ibctx->cq, 1);
             return(-1);
         }
 
         /* suppress successful send operations */
-        if (cqe.opcode == IBV_WC_SEND && cqe.status == IBV_WC_SUCCESS) {
+        if (poll_res > 0 && cqe.opcode == IBV_WC_SEND && 
+            cqe.status == IBV_WC_SUCCESS) {
             
             if (cqe.wc_flags & IBV_WC_WITH_IMM) {
                 logmsg(DEBUG, "Skipping send request (id %lu, imm %u)", 
@@ -663,17 +655,79 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
             else
                 logmsg(DEBUG, "Skipping send request.");
            
-
             poll_res = 0;
+            continue;
         }
 
         if ((cqe.wr_id & IGNORE_CQE_MASK) && cqe.status == IBV_WC_SUCCESS) {
             /* issuing thread requested to ignore this CQE on success */
             poll_res = 0;
+            continue;
         }
 
-        /* acknowledge the event read */
-        ibv_ack_cq_events(ibctx->cq, 1);
+        if (ibv_req_notify_cq(ibctx->cq, 0) == -1) {
+            logmsg(ERROR, "Failed to rearm notification mechanism of CQ.");
+            return(-1);
+        }
+
+        if (poll_res > 0)
+            break;
+
+        /* take the notification lock to avoid interference with other threads*/
+        pthread_mutex_lock(&ibctx->notify_lck);
+
+        /* get the actual event from the CQ */
+        poll_res = ibv_poll_cq(ibctx->cq, 1, &cqe);
+        if (poll_res < 0) {
+            pthread_mutex_unlock(&ibctx->notify_lck);
+            logmsg(ERROR, "Could not read completion event from CQ.");
+            return(-1);
+        }
+
+        /* suppress successful send operations */
+        if (poll_res > 0 && cqe.opcode == IBV_WC_SEND && 
+            cqe.status == IBV_WC_SUCCESS) {
+            pthread_mutex_unlock(&ibctx->notify_lck);
+
+            if (cqe.wc_flags & IBV_WC_WITH_IMM) {
+                logmsg(DEBUG, "Skipping send request (id %lu, imm %u)", 
+                       cqe.wr_id, cqe.imm_data);
+            }
+            else
+                logmsg(DEBUG, "Skipping send request.");
+      
+            poll_res = 0;
+            continue;
+        }
+
+        if ((cqe.wr_id & IGNORE_CQE_MASK) && cqe.status == IBV_WC_SUCCESS) {
+            /* issuing thread requested to ignore this CQE on success */
+            pthread_mutex_unlock(&ibctx->notify_lck);
+            poll_res = 0;
+            continue;
+        }
+
+        if (poll_res == 0) {
+            logmsg(DEBUG, "Waiting for IB message.");
+            if (ibv_get_cq_event(ibctx->cchannel, &cq, &compl_ctx) == -1) {
+                pthread_mutex_unlock(&ibctx->notify_lck);
+                logmsg(ERROR, "Failed to get next completion event "
+                       "notification.");
+                return(-1);
+            }
+    
+            /* this should be always false, but check for completeness      */
+            if (cq != ibctx->cq) {
+                pthread_mutex_unlock(&ibctx->notify_lck);
+                logmsg(ERROR, "CChannel delivered event from wrong CQ.");
+                return(-1);
+            }
+    
+            /* acknowledge the event read */
+            ibv_ack_cq_events(ibctx->cq, 1);
+        }
+            
+        pthread_mutex_unlock(&ibctx->notify_lck);
     }
 
     if (cqe.status != IBV_WC_SUCCESS) {
@@ -741,6 +795,7 @@ int poll_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
 
     /* get the actual event from the CQ */
     while (poll_res == 0) {
+        memset(&cqe, 0, sizeof(struct ibv_wc));
         poll_res = ibv_poll_cq(ibctx->cq, 1, &cqe);
 
         if (poll_res < 0) {

@@ -89,6 +89,7 @@ struct crdss_posix_file {
     struct crdss_clt_cap cap;           /* cap for file access              */
 
     unsigned long int file_ptr;         /* position in file for read/write  */
+    int ref_cnt;                        /* number of times the file is open */
 };
 
 /****************************************************************************   
@@ -110,7 +111,8 @@ static pthread_once_t log_init = PTHREAD_ONCE_INIT;
 
 /* array for file contexts                                                  */
 static struct crdss_posix_file *fd_table[LIBCRDSS_MAX_FD];
-/* static pthread_mutex_t table_lck = PTHREAD_MUTEX_INITIALIZER; */
+static pthread_mutex_t table_lck;
+static pthread_once_t table_lck_init = PTHREAD_ONCE_INIT;
 
 /* pointers to functions defined by libc but partially shadowed by the POSIX*
  * emulation of libcrdss.                                                   */
@@ -137,6 +139,20 @@ static int (*libc_open64)(const char *, int, ...)                 = NULL;
  */
 static void setup_logger(void) {
     init_logger("/dev/stderr", INFO);
+}
+
+/****************************************************************************
+ *
+ * Initializes the lock for the file descriptor table of the POSIX
+ * compatibility layer.
+ */
+static void setup_tbl_lck(void) {
+    pthread_mutexattr_t attr;
+
+    /* we do want to have a re-entrant lock here... */
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&table_lck, &attr);
 }
 
 /****************************************************************************
@@ -888,11 +904,18 @@ int reg_cap(struct crdss_srv_ctx *sctx, unsigned char *capid) {
         msg_buf[0] = MTYPE_REGCAP;
         memcpy(msg_buf + 1, capid, CAP_ID_LEN);
 
-        if (post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid) != 0) {
+        logmsg(DEBUG, "reg_cap: sending request to the server.");
+        while ((op_res = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid)) == 
+               12) {
+            logmsg(DEBUG, "delete_rdom: waiting for free send queue.");
+        }
+        if (op_res != 0) {
             /* failed to trigger IB send op. */
+            logmsg(ERROR, "reg_cap: Failed to send request to server.");
             return(1);
         }
-        
+
+        logmsg(DEBUG, "reg_cap: waiting for answer of server.");
         if (wait_for_ibmsg(work_ctx, work_ctx->tid) != 0) {
             /* receive op failed */
             return(1);
@@ -952,8 +975,13 @@ int delete_rdom(struct crdss_srv_ctx *sctx, uint32_t rdom) {
         msg_buf[0] = MTYPE_RMDOM;
         memcpy(msg_buf + 1, &rdom, sizeof(uint32_t));
 
-        if (post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid) != 0) {
+        while ((op_res = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid)) == 
+               12) {
+            logmsg(DEBUG, "delete_rdom: waiting for free send queue.");
+        }
+        if (op_res != 0) {
             /* failed to trigger IB send op. */
+            logmsg(ERROR, "delete_rdom: Failed to send request to server.");
             return(1);
         }
 
@@ -1182,7 +1210,7 @@ int fast_read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         /* spin in this loop until the result arrived */
         logmsg(DEBUG, "fast_read_raw: spinning on addr %p.", (void *) pf_ptr);
         while (*pf_ptr == R_UNDEF) { 
-            /* usleep(LIBCRDSS_POLL_INT); */
+            usleep(LIBCRDSS_POLL_INT); 
         }
 
         if (*pf_ptr != R_SUCCESS)
@@ -1271,11 +1299,15 @@ int fast_write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         *pf_ptr = R_UNDEF;
 
         /* transfer data, afterwards send the actual request */
-        if (init_rdma_transfer(&sctx->ibctx, (unsigned char *) rdma_addr,
-                               (unsigned char *) rdma_rem_addr, cur_len, 
-                               0, 0, 0) != 0) {
-            return(R_FAILURE);
-        }
+        while ((ret = init_rdma_transfer(&sctx->ibctx,                          
+                 (unsigned char *) rdma_addr, (unsigned char *) rdma_rem_addr,   
+                cur_len, 0, 0, 0)) == 12) {                                     
+            usleep(LIBCRDSS_POLL_INT);                                          
+        }                                                                       
+                                                                                 
+        if (ret != 0) {                                                         
+            return(R_FAILURE);                                                  
+        } 
 
         /* trigger the actual request at the server */
         while ((ret = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid)) == 12){
@@ -1291,7 +1323,7 @@ int fast_write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
 
         /* spin in this loop until the result arrived */
         while (*pf_ptr == R_UNDEF) {
-            /* usleep(LIBCRDSS_POLL_INT); */
+            usleep(LIBCRDSS_POLL_INT);
         }
 
         if (*pf_ptr != R_SUCCESS)
@@ -1773,6 +1805,9 @@ int open64(const char *pathname, int flags, ...) {
     int os_fd;                          /* fd returned from OS              */
     uint64_t slice_size = 0;            /* size of opened vslice            */
 
+    /* if not done yet, initialize the table lock */
+    pthread_once(&table_lck_init, &setup_tbl_lck);
+
     if (libc_open64 == NULL)
         libc_open64 = dlsym(RTLD_NEXT, "open64");
 
@@ -1796,14 +1831,20 @@ int open64(const char *pathname, int flags, ...) {
         return(ret);
     }
 
-    fprintf(stderr, "Entering custom part of open64!\n");
+    /* fprintf(stderr, "Entering custom part of open64 (%s)!\n", basename); */
+
+    /* lock fd table to avoid race conditions */
+    pthread_mutex_lock(&table_lck);
 
 /* #ifdef REUSE_FNAME */
     /* check if there is already a session for the file specified */
     for (i = 0; i < LIBCRDSS_MAX_FD; i++) {
         if (fd_table[i] != NULL && strcmp(basename, fd_table[i]->name) == 0) {
             /* file name is already opened */
+            /* fprintf(stderr, "Reusing existing CRDSS session.\n"); */
             free(basename);
+            fd_table[i]->ref_cnt = fd_table[i]->ref_cnt + 1;
+            pthread_mutex_unlock(&table_lck);
             return(i);
         }
     }
@@ -1819,7 +1860,8 @@ int open64(const char *pathname, int flags, ...) {
         errno = ENOMEM;
         goto file_alloc_err;
     }
-    pfile->name = basename;
+    pfile->name    = basename;
+    pfile->ref_cnt = 1;
 
     /* try to derive basic information about requested device from path     */
     if (init_ccap_from_path(basename, &pfile->cap) != 0) {
@@ -1827,10 +1869,10 @@ int open64(const char *pathname, int flags, ...) {
         return(-1);
     }
    
-    /*
+    /* 
     printf("derived cap from file name. didx = %u, sidx = %u\n", 
           pfile->cap.dev_idx, pfile->cap.vslc_idx);
-    */
+     */
 
     /* derive rights of capability from flags parameter */
     if ((flags & O_ACCMODE) == O_RDONLY) {
@@ -1862,9 +1904,6 @@ int open64(const char *pathname, int flags, ...) {
     pfile->cap.start_addr = 0;
     pfile->cap.end_addr   = slice_size - 1;
 
-    /* lock fd table to avoid race conditions */
-    // pthread_mutex_lock(&table_lck);
-
     /* get backing fd to /dev/null */
     os_fd = libc_open64("/dev/null", O_WRONLY, 0);
     if (os_fd < 0)
@@ -1874,7 +1913,7 @@ int open64(const char *pathname, int flags, ...) {
         goto fd_err;
     }
 
-    logmsg(DEBUG, "os_fd is: %d\n", os_fd);
+    logmsg(INFO, "os_fd is: %d\n", os_fd);
     /* set entry in fd table */
     fd_table[os_fd] = pfile;
 
@@ -1900,6 +1939,7 @@ int open64(const char *pathname, int flags, ...) {
         errno = ENXIO;
         goto cap_err;
     }
+    logmsg(INFO, "connected to storage server.");
 
     /* register cap at server */
     if (reg_cap(pfile->sctx, pfile->cap.id) != 0) {
@@ -1907,18 +1947,19 @@ int open64(const char *pathname, int flags, ...) {
         errno = EPERM;
         goto reg_err;
     }
-  
+
     /* setup IB communication for further I/O operations */
     if (init_ib_comm(pfile->sctx) != 0) {
         printf("Failed to setup IB communication with crdss server.\n");
         errno = ENXIO;
         goto reg_err;
     }
+    logmsg(INFO, "setup IB comm.");
 
     /* switch server to polling mode */
     query_srv_poll(pfile->sctx);
 
-    // pthread_mutex_unlock(&table_lck);
+    pthread_mutex_unlock(&table_lck);
     return(os_fd);
 
 reg_err:
@@ -1930,7 +1971,7 @@ sctx_err:
 fd_err:
     close(os_fd);
 open_err:
-    // pthread_mutex_unlock(&table_lck);
+    pthread_mutex_unlock(&table_lck);
 rights_err:
     free(pfile);
 file_alloc_err:
@@ -1943,20 +1984,25 @@ file_alloc_err:
 int close(int fd) {
     if (libc_close == NULL)
         libc_close = dlsym(RTLD_NEXT, "close");
-*/
-    /* fprintf(stderr, "Called close for fd %d!\n", fd); */
+    fprintf(stderr, "Called close for fd %d!\n", fd);
 
-    /* pthread_mutex_lock(&table_lck); */
-/*    if (fd_table[fd] != NULL) {*/
-        /* tear down server connection */
-/*        fprintf(stderr, "destroying custom data structure (fd = %d).\n", fd);
-        close_srv_conn(fd_table[fd]->sctx);
-        free(fd_table[fd]);
-        if (fd_table[fd]->name != NULL) free(fd_table[fd]->name);
-        fd_table[fd] = NULL;
-        fprintf(stderr, "destruction of fd %d done, calling close(2).\n", fd);
-    }*/
-    /* pthread_mutex_unlock(&table_lck); */
-/*
+    pthread_mutex_lock(&table_lck);
+    if (fd_table[fd] != NULL) {
+        fd_table[fd]->ref_cnt = fd_table[fd]->ref_cnt - 1;
+        if (fd_table[fd]->ref_cnt == 0) { */
+            /* tear down server connection */
+            /*
+            fprintf(stderr, "destroying custom data structure (fd = %d).\n", 
+                    fd);
+            close_srv_conn(fd_table[fd]->sctx);
+            if (fd_table[fd]->name != NULL) free(fd_table[fd]->name);
+            free(fd_table[fd]);
+            fd_table[fd] = NULL;
+            fprintf(stderr, "destruction of fd %d done, calling close(2).\n", 
+                    fd);
+        }
+    }
+    pthread_mutex_unlock(&table_lck);
+
     return(libc_close(fd));
 } */
