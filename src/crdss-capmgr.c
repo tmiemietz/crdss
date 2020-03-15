@@ -1220,9 +1220,9 @@ int main(int argc, char **argv) {
     /* set log path. if logpath == NULL, stderr is used since the server    *
      * won't run as a daemon in this case (see error conditions above)      */
     if (logpath != NULL)
-        init_logger(logpath, DEBUG);
+        init_logger(logpath, capmgr_cfg.loglevel);
     else
-        init_logger("/dev/stderr", DEBUG);        
+        init_logger("/dev/stderr", capmgr_cfg.loglevel);        
 
     /* logpath-related memory is no longer needed, free it immediately      */
     if (logdir != NULL)

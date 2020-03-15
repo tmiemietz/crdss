@@ -296,4 +296,18 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm);
  */
 int poll_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm);
 
+/****************************************************************************
+ *
+ * Function to call during clean up of a thread that uses the get_next_ibmsg
+ * routine for retrieving messages of a queue pair. The function will ensure
+ * that the calling thread releases the notification lock during exiting. 
+ * This is important in order to execute safe worker thread cancellation 
+ * during session teardown. 
+ * This routine shall be set as an exit handler for all IB worker threads at
+ * the server and all completion worker threads on the client side.
+ *
+ * Params: ptr - pointer to an InfiniBand context structure.
+ */
+void worker_cleanup(void *ptr);
+
 #endif /* IBCOMM_H */

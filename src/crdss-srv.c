@@ -997,6 +997,39 @@ static int handle_write(struct handler *handler, uint16_t didx, uint32_t sidx,
 
 /****************************************************************************
  *
+ * Handles a sync request sent by a client. Calling this routine does not
+ * require ownership of capabilities to the device specified. The call
+ * will fail if the device index is out of bounds or if there are any errors
+ * upon calling sync.
+ *
+ * Params: didx - index of device to sync.
+ *
+ * Returns: 0 on success, a CRDSS error number else.
+ */
+static int handle_sync(uint16_t didx) {
+    unsigned int i;
+    struct slist *lptr = devs;
+    struct crdss_bdev *dev;
+
+    /* check if dev index is already out of bounds */
+    if (slist_empty(devs) || didx > (slist_length(devs) - 1))
+        return(R_INVAL);
+
+    /* move to requested device to obtain its fd */
+    for (i = 0; i < didx; i++)
+        lptr = lptr->next;
+
+    dev = (struct crdss_bdev *) lptr->data;
+    if (fsync(dev->fd) != 0) {
+        logmsg(ERROR, "Failed to sync device with index %u (%d).", didx, errno);
+        return(R_FAILURE);
+    }
+
+    return(R_SUCCESS);
+}
+
+/****************************************************************************
+ *
  * Derives a new capability from the cap identified by the ID passed to 
  * this routine. The new capability will be placed inside a new revocation
  * domain which will be a child of the rdom of the parent cap. A pointer to
@@ -1624,6 +1657,10 @@ static void *ib_worker(void *ctx) {
     uint64_t poll_field;                        /* doorbell address offset  */
 
     logmsg(DEBUG, "Handler %lu: Started IB worker thread.", handler->tid);
+    
+    /* register clean up function for blocking completion notifications     */
+    pthread_cleanup_push(&worker_cleanup, handler->ibctx);
+
     while (1) {
         if (get_next_msg_type(handler, &msg, &msg_type, &imm) != 0) {
             logmsg(ERROR, "Handler %lu: IB Worker: Error in InfiniBand "
@@ -2019,6 +2056,22 @@ static void *ib_worker(void *ctx) {
                 /* recycle recv request */
                 post_msg_rr(handler->ibctx, msg, 1);
                 break;
+            case MTYPE_SYNC:
+                logmsg(DEBUG, "Handler %lu (IBW): received sync request.",
+                       handler->tid);
+
+                device_idx = ntohs(*((uint16_t *) (msg + 1)));
+                memset(send_buf, 0, MAX_MSG_LEN);
+               
+                op_res = handle_sync(device_idx);
+                logmsg(DEBUG, "Handler %lu (IBW): sync returned %d",
+                       handler->tid, op_res);
+                send_buf[0] = op_res;
+                post_msg_sr(handler->ibctx, send_buf, imm);
+                
+                /* recycle recv request */
+                post_msg_rr(handler->ibctx, msg, 1);
+                break;
             default:
                 logmsg(WARN, "Handler %lu: Received unknown message type %u.",
                        handler->tid, msg_type);
@@ -2029,6 +2082,8 @@ static void *ib_worker(void *ctx) {
         }
     }
 
+    /* pop cleanup handler before leaving the function */
+    pthread_cleanup_pop(0);
     return(NULL);
 }
 
@@ -2163,13 +2218,20 @@ static void close_ib_conn(struct handler *handler) {
     /* kill InfiniBand worker threads */
     logmsg(DEBUG, "Handler %lu: Killing %u IB worker threads.", handler->tid,
            handler->worker_cnt);
+    /* cancel worker threads, they may wait on a notification mutex, so     *
+     * unlock it on every operation. This is not dangerous since the        *
+     * respective mutex is followed by an immediate call to                 *
+     * pthread_testcancel().                                                */
     for (i = 0; i < handler->worker_cnt; i++) {
         pthread_cancel(handler->ib_workers[i]);
+    }
+    for (i = 0; i < handler->worker_cnt; i++) {
         pthread_join(handler->ib_workers[i], &res);
     }
     free(handler->ib_workers);
     handler->ib_workers = NULL;
 
+    logmsg(DEBUG, "Handler %lu: Shutting down IB connection.", handler->tid);
     if (destroy_ibctx(handler->ibctx) != 0) {
         logmsg(WARN, "Handler %lu: Teardown of IB conn. failed.", 
                handler->tid);

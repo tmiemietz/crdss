@@ -54,6 +54,7 @@
 #define MTYPE_FASTREAD  0x22                /* read with polling at client  */
 #define MTYPE_WRITE     0x23
 #define MTYPE_FASTWRITE 0x24                /* write with polling at client */
+#define MTYPE_SYNC      0x25                /* write all data to disk       */
 
 /* messages for server management */
 #define MTYPE_CPOLL     0x50                /* use polling completion       */

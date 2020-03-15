@@ -1010,6 +1010,10 @@ int parse_lib_config(char *confpath, struct clt_lib_cfg *cconf) {
                     char *cnt = (char *) attr->values->data;
                     cconf->lbuf_cnt = strtoul(cnt, NULL, 0);
                 }
+                else if (strcmp(attr->key, "use_poll") == 0) {
+                    char *flag = (char *) attr->values->data;
+                    cconf->use_poll = atoi(flag);
+                }
                 else {
                     fprintf(stderr, "Ignoring unknown attribute \"%s\" in " 
                             "config element LIB\n", attr->key);

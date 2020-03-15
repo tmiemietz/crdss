@@ -17,24 +17,6 @@
 
 #define _GNU_SOURCE
 
-/* worker ID for threads above the no_worker limit of the buffer config     */
-#define WORKER_UNREG UINT16_MAX
-
-/* size of a single cache line in Bytes (== size for doorbell fields)       */
-#define CL_SIZE 512             /* for alignment of send buffers            */
-
-/* maximum file descriptor that can be used for CRDSS files                 */
-#define LIBCRDSS_MAX_FD 1024
-
-/* IB GUID for testing (make variable for release)                          */
-#define LIBCRDSS_TEST_GUID "0xf45214030010a4e1"
-
-/* number of retries if send queue is full                                  */
-#define LIBCRDSS_SQ_FRT 5
-
-/* interval to wait between checks of doorbell register in us               */
-#define LIBCRDSS_POLL_INT 2
-
 /****************************************************************************
  *                                                                          *
  *                           include statements                             *
@@ -53,6 +35,7 @@
 #include <unistd.h>                         /* standard UNIX calls          */
 #include <sys/syscall.h>                    /* for calling gettid           */
 #include <dlfcn.h>                          /* for playing with symbols...  */
+#include <ctype.h>                          /* check character classes      */
 
 #include "include/libcrdss.h"               /* header for libcrdss impl.    */
 #include "include/protocol.h"               /* CRDSS protocol               */
@@ -89,6 +72,7 @@ struct crdss_posix_file {
     struct crdss_clt_cap cap;           /* cap for file access              */
 
     unsigned long int file_ptr;         /* position in file for read/write  */
+    ssize_t           size;             /* file size in bytes               */
     int ref_cnt;                        /* number of times the file is open */
 };
 
@@ -120,7 +104,11 @@ static ssize_t (*libc_pread64)(int, void *, size_t, off_t)        = NULL;
 static ssize_t (*libc_pwrite64)(int, const void *, size_t, off_t) = NULL;
 static int (*libc_xstat64)(int, const char *, struct stat64 *)    = NULL;
 static int (*libc_lxstat64)(int, const char *, struct stat64 *)   = NULL;
+static int (*libc_fstat)(int, struct stat *)                      = NULL;
 static int (*libc_open64)(const char *, int, ...)                 = NULL;
+static int (*libc_fcntl)(int, int, ...)                           = NULL;
+static int (*libc_fdatasync)(int)                                 = NULL;       
+/* enabling the custom close function for now still causes deadlocks...     */
 /* static int (*libc_close)(int)                                     = NULL; */
 
 /****************************************************************************
@@ -138,7 +126,7 @@ static int (*libc_open64)(const char *, int, ...)                 = NULL;
  * changing the parameters of init_logger.
  */
 static void setup_logger(void) {
-    init_logger("/dev/stderr", INFO);
+    init_logger("/dev/stderr", DEBUG);
 }
 
 /****************************************************************************
@@ -289,8 +277,18 @@ static void *completion_worker(void *ctx) {
 
     struct slist *lptr;                 /* ptr for list iteration           */
 
+    /* register clean up function for cancelling blocking completion calls  */
+    pthread_cleanup_push(&worker_cleanup, &sctx->ibctx);
+
     while (1) {
-        ret = get_next_ibmsg(&sctx->ibctx, &msg, &imm);
+        if (sctx->buf_cfg.use_poll == 0) {
+            ret = get_next_ibmsg(&sctx->ibctx, &msg, &imm);
+        }
+        else {
+            ret = poll_next_ibmsg(&sctx->ibctx, &msg, &imm);
+        }
+        
+        /* ret = get_next_ibmsg(&sctx->ibctx, &msg, &imm); */
         logmsg(DEBUG, "comp worker: got new message (imm = %u)!", imm);
 
         pthread_mutex_lock(&sctx->wait_lck);
@@ -309,6 +307,7 @@ static void *completion_worker(void *ctx) {
                 wcontext->msg    = msg;
 
                 sctx->wait_workers = slist_remove(sctx->wait_workers, wcontext);
+                pthread_mutex_unlock(&sctx->wait_lck);
 
                 pthread_mutex_lock(&wcontext->mtx);
                 pthread_cond_signal(&wcontext->cv);
@@ -336,11 +335,12 @@ static void *completion_worker(void *ctx) {
                 pthread_mutex_unlock(&sctx->wait_lck);
                 continue;
             }
+        
+            pthread_mutex_unlock(&sctx->wait_lck);
         }
-
-        pthread_mutex_unlock(&sctx->wait_lck);
     }
 
+    pthread_cleanup_pop(0);
     return(NULL);
 }
 
@@ -791,11 +791,28 @@ int init_ib_comm(struct crdss_srv_ctx *sctx) {
         lbuf_offs += sctx->buf_cfg.lbuf_size;
     }
 
-    /* start the completion worker thread */
-    if (pthread_create(&sctx->compl_worker, NULL, completion_worker, sctx) != 0)
+    /* start the completion worker threads */
+    if (sctx->buf_cfg.use_poll != 0) {
+        sctx->cw_cnt = ((sctx->buf_cfg.no_workers - 1) / 
+                         LIBCRDSS_AT_PER_CW_POLL) + 1;
+    }
+    else {
+        sctx->cw_cnt = ((sctx->buf_cfg.no_workers - 1) / 
+                         LIBCRDSS_AT_PER_CW_BLOCK) + 1;
+    }
+    if ((sctx->compl_workers = calloc(sctx->cw_cnt, sizeof(pthread_t))) == NULL)
     {
-        /* unable to start handler thread for completion notification */
+        logmsg(ERROR, "Failed to allocate memory for completion workers.");
         return(1);
+    }
+
+    logmsg(INFO, "Starting %u completion worker threads.", sctx->cw_cnt);
+    for (i = 0; i < sctx->cw_cnt; i++) {
+        if (pthread_create(&sctx->compl_workers[i], NULL, completion_worker, 
+            sctx) != 0) {
+            logmsg(ERROR, "Unable to start completion workers.");
+            return(1);
+        }
     }
 
     /* notify all threads that may have already blocked in expectation of   *
@@ -810,6 +827,7 @@ int init_ib_comm(struct crdss_srv_ctx *sctx) {
 
 /* Closes a connection to a CRDSS storage server.                           */
 int close_srv_conn(struct crdss_srv_ctx *sctx) {
+    unsigned int i;
     uint8_t opcode = MTYPE_BYE;             /* ID for server operation      */
     void *compl_rc = NULL;                  /* return value of compl. worker*/
 
@@ -830,14 +848,23 @@ int close_srv_conn(struct crdss_srv_ctx *sctx) {
     
     /* if an IB connection was active, close it first */
     if (sctx->msg_buf != NULL) {
-        /* cancel the completion worker thread */
-        pthread_cancel(sctx->compl_worker);
-        pthread_join(sctx->compl_worker, compl_rc);
-        logmsg(DEBUG, "Completion worker cancelled.");
+        /* cancel the completion worker threads */
+        logmsg(DEBUG, "Cancelling %u completion workers.", sctx->cw_cnt);
+        for (i = 0; i < sctx->cw_cnt; i++) {
+            pthread_cancel(sctx->compl_workers[i]);
+        }
+        for (i = 0; i < sctx->cw_cnt; i++) {
+            pthread_join(sctx->compl_workers[i], compl_rc);
+        }
+        logmsg(DEBUG, "Cancelled %u completion workers.", sctx->cw_cnt);
 
         destroy_ibctx(&sctx->ibctx);
-        free(sctx->msg_buf);
-        free(sctx->rdma_buf);
+        logmsg(DEBUG, "Destroyed ibctx.");
+        if (sctx->msg_buf != NULL)       free(sctx->msg_buf);
+        if (sctx->rdma_buf != NULL)      free(sctx->rdma_buf);
+        logmsg(DEBUG, "deallocated data buffers.");
+        if (sctx->compl_workers != NULL) free(sctx->compl_workers);
+        logmsg(DEBUG, "deallocated buffers.");
 
         sctx->msg_buf  = NULL;
         sctx->rdma_buf = NULL;
@@ -907,7 +934,7 @@ int reg_cap(struct crdss_srv_ctx *sctx, unsigned char *capid) {
         logmsg(DEBUG, "reg_cap: sending request to the server.");
         while ((op_res = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid)) == 
                12) {
-            logmsg(DEBUG, "delete_rdom: waiting for free send queue.");
+            logmsg(DEBUG, "reg_cap: waiting for free send queue.");
         }
         if (op_res != 0) {
             /* failed to trigger IB send op. */
@@ -998,6 +1025,56 @@ int delete_rdom(struct crdss_srv_ctx *sctx, uint32_t rdom) {
 
         return(op_res);
     }
+}
+
+/* Requests the server to sync all data of a certain device.                */
+int libcrdss_sync(struct crdss_srv_ctx *sctx, uint16_t didx) {
+    uint8_t op_res = R_FAILURE;             /* result of srv operation      */
+    unsigned char msg_buf[MAX_MSG_LEN];     /* msg for IB transfer          */
+
+    struct wctx *work_ctx = NULL;           /* worker context for this thrd */
+    uint16_t didx_nw;                       /* didx in network byte order   */
+
+    pthread_mutex_lock(&sctx->tcp_lck);
+
+    if (sctx->msg_buf == NULL) {
+        pthread_mutex_unlock(&sctx->tcp_lck);
+        logmsg(ERROR, "Syncing requires an active IB connection.");
+        return(R_FAILURE);
+    }
+
+    pthread_mutex_unlock(&sctx->tcp_lck);
+    work_ctx = get_wctx(sctx);
+    didx_nw  = htons(didx);
+
+    memset(msg_buf, 0, MAX_MSG_LEN);
+    msg_buf[0] = MTYPE_SYNC;
+    memcpy(msg_buf + 1, &didx_nw, sizeof(uint16_t));
+
+    logmsg(DEBUG, "libcrdss_sync: sending request to the server.");
+    while ((op_res = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid)) == 12) {
+        logmsg(DEBUG, "libcrdss_sync: waiting for free send queue.");
+        usleep(LIBCRDSS_SR_RETRY_INT);
+    }
+    if (op_res != 0) {
+        /* failed to trigger IB send op. */
+        logmsg(ERROR, "libcrdss_sync: Failed to send request to server.");
+        return(1);
+    }
+
+    logmsg(DEBUG, "libcrdss_sync: waiting for answer of server.");
+    if (wait_for_ibmsg(work_ctx, work_ctx->tid) != 0) {
+        /* receive op failed */
+        return(1);
+    }
+
+    op_res = (uint8_t) work_ctx->msg[0];
+    /* repost receive request */
+    if (post_msg_rr(&sctx->ibctx, work_ctx->msg, 1) != 0) {
+        return(1);
+    }
+
+    return(op_res);
 }
 
 /* Queries the server identified by sctx to switch to polling completion.   */
@@ -1200,7 +1277,8 @@ int fast_read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         logmsg(DEBUG, "fast_read_raw: sending request to server.");
         while ((ret = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid)) == 12){
             /* failed to post send request, but retry once SQ is polled     */
-            usleep(LIBCRDSS_POLL_INT);
+            usleep(LIBCRDSS_SR_RETRY_INT);
+            /* pthread_yield(); */
         }
 
         /* if we left the loop, this indicates either success or a severe err */
@@ -1302,7 +1380,8 @@ int fast_write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         while ((ret = init_rdma_transfer(&sctx->ibctx, 
                 (unsigned char *) rdma_addr, (unsigned char *) rdma_rem_addr, 
                 cur_len, 0, 0, 0)) == 12) {
-            usleep(LIBCRDSS_POLL_INT);
+            usleep(LIBCRDSS_SR_RETRY_INT);
+            /* pthread_yield(); */
         }
 
         if (ret != 0) {
@@ -1312,7 +1391,8 @@ int fast_write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         /* trigger the actual request at the server */
         while ((ret = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid)) == 12){
             /* failed to post send request, but retry once SQ is polled     */
-            usleep(LIBCRDSS_POLL_INT);
+            usleep(LIBCRDSS_SR_RETRY_INT);
+            /* pthread_yield(); */
         }
 
         /* if we left the loop, this indicates either success or a severe err */
@@ -1600,7 +1680,7 @@ ssize_t pread64(int fd, void *buf, size_t count, off_t offset) {
                             fd_table[fd]->cap.vslc_idx, (uint64_t) offset, buf,
                             count);
 
-        logmsg(DEBUG, "finished read op");
+        logmsg(DEBUG, "finished read op (%d)", ret);
         if (ret != 0) {
             errno = EIO;
             return(-1);
@@ -1676,6 +1756,7 @@ int __xstat64(int ver, const char *path, struct stat64 * stat_buf) {
 
     char *basename = NULL;              /* basename of path                 */
     char *last_sep = NULL;              /* last occurence of '/' in path    */
+    char end_char  = '\0';              /* last character of basename       */
 
     if (libc_xstat64 == NULL)
         libc_xstat64 = dlsym(RTLD_NEXT, "__xstat64");
@@ -1689,10 +1770,14 @@ int __xstat64(int ver, const char *path, struct stat64 * stat_buf) {
     else
         basename = strdup(last_sep + 1);
 
-    if (strncmp(basename, "crdss", 5) != 0)
+    if (strlen(basename) > 0) {
+        end_char = *(basename + strlen(basename) - 1);
+    }
+
+    if (strncmp(basename, "crdss", 5) != 0 || isdigit(end_char) == 0)
         return(libc_xstat64(ver, path, stat_buf));
-    
-    logmsg(DEBUG, "Entering custom part of __xstat64!\n");
+   
+    logmsg(DEBUG, "Entering custom part of __xstat64 (%s)!", path);
     /* else: provide custom values for the crdss file */
     memset(stat_buf, 0, sizeof(struct stat64));
  
@@ -1738,6 +1823,7 @@ int __lxstat64(int ver, const char *path, struct stat64 * stat_buf) {
 
     char *basename = NULL;              /* basename of path                 */
     char *last_sep = NULL;              /* last occurence of '/' in path    */
+    char end_char  = '\0';              /* last character of basename       */
 
     if (libc_lxstat64 == NULL)
         libc_lxstat64 = dlsym(RTLD_NEXT, "__lxstat64");
@@ -1751,10 +1837,14 @@ int __lxstat64(int ver, const char *path, struct stat64 * stat_buf) {
     else
         basename = strdup(last_sep + 1);
 
-    if (strncmp(basename, "crdss", 5) != 0)
+    if (strlen(basename) > 0) {
+        end_char = *(basename + strlen(basename) - 1);
+    }
+
+    if (strncmp(basename, "crdss", 5) != 0 || isdigit(end_char) == 0)
         return(libc_lxstat64(ver, path, stat_buf));
     
-    logmsg(DEBUG, "Entering custom part of __lxstat64!\n");
+    logmsg(DEBUG, "Entering custom part of __lxstat64!");
     /* else: provide custom values for the crdss file */
     memset(stat_buf, 0, sizeof(struct stat64));
  
@@ -1792,6 +1882,41 @@ int __lxstat64(int ver, const char *path, struct stat64 * stat_buf) {
     return(0);
 }
 
+/* Linux wrapper for stat system calls with file descriptors                */
+int fstat(int fildes, struct stat *buf) {
+    if (libc_fstat == NULL)
+        libc_fstat = dlsym(RTLD_NEXT, "fstat");
+
+    if (fd_table[fildes] == NULL)
+        return(libc_fstat(fildes, buf));
+   
+    logmsg(DEBUG, "Entering custom part of fstat (%d)!", fildes);
+    /* else: provide custom values for the crdss file */
+    memset(buf, 0, sizeof(struct stat));
+ 
+    if (fd_table[fildes]->size == -1) {
+        uint64_t fsize;
+        /* printf("Getting vslice size...\n"); */
+        /* query size of vslice */
+        if (get_vslice_size(&fd_table[fildes]->cap, &fsize) != R_SUCCESS) { 
+            return(-1);
+        }
+
+        fd_table[fildes]->size = (ssize_t) fsize;
+    }
+
+    /* printf("vslice size is %lu\n", vslc_size); */
+    buf->st_size  = fd_table[fildes]->size;
+
+    buf->st_mode  = S_IFREG;                /* disguise as regular file     */
+    buf->st_mode |= S_IRUSR;
+    buf->st_mode |= S_IWUSR;
+
+    buf->st_uid = getuid();
+    buf->st_gid = getgid();
+
+    return(0);
+}
 /* System call wrapper for open.                                            */
 int open64(const char *pathname, int flags, ...) {
 /* #ifdef REUSE_FNAME */
@@ -1800,6 +1925,7 @@ int open64(const char *pathname, int flags, ...) {
 
     char *basename = NULL;              /* basename of path                 */
     char *last_sep = NULL;              /* last occurence of '/' in path    */
+    char end_char  = '\0';              /* last character of basename       */
 
     struct crdss_posix_file *pfile = NULL;
     int os_fd;                          /* fd returned from OS              */
@@ -1820,18 +1946,26 @@ int open64(const char *pathname, int flags, ...) {
     else
         basename = strdup(last_sep + 1);
 
-    if (strncmp(basename, "crdss", 5) != 0) {
+    if (strlen(basename) > 0) {
+        end_char = *(basename + strlen(basename) - 1);
+    }
+
+    if (strncmp(basename, "crdss", 5) != 0 || isdigit(end_char) == 0) {
         int ret = -1;                               /* rc of real open64    */
         va_list arglist;
-    
+        void *arg;
+
+        /* somehow the way below works for passing variadic arguments from  *
+         * one function to another, but I don't know if it's safe...        */
         va_start(arglist, flags);
-        ret = libc_open64(pathname, flags, arglist);
+        arg = va_arg(arglist, void *);
+        ret = libc_open64(pathname, flags, arg);
         va_end(arglist);
         free(basename);
         return(ret);
     }
 
-    /* fprintf(stderr, "Entering custom part of open64 (%s)!\n", basename); */
+    fprintf(stderr, "Entering custom part of open64 (%s)!\n", basename);
 
     /* lock fd table to avoid race conditions */
     pthread_mutex_lock(&table_lck);
@@ -1862,6 +1996,7 @@ int open64(const char *pathname, int flags, ...) {
     }
     pfile->name    = basename;
     pfile->ref_cnt = 1;
+    pfile->size    = -1;
 
     /* try to derive basic information about requested device from path     */
     if (init_ccap_from_path(basename, &pfile->cap) != 0) {
@@ -1869,10 +2004,10 @@ int open64(const char *pathname, int flags, ...) {
         return(-1);
     }
    
-    
+    /* 
     printf("derived cap from file name. didx = %u, sidx = %u\n", 
           pfile->cap.dev_idx, pfile->cap.vslc_idx);
-   
+    */
 
     /* derive rights of capability from flags parameter */
     if ((flags & O_ACCMODE) == O_RDONLY) {
@@ -1957,7 +2092,14 @@ int open64(const char *pathname, int flags, ...) {
     logmsg(INFO, "setup IB comm.");
 
     /* switch server to polling mode */
-    /* query_srv_poll(pfile->sctx); */
+    if (pfile->sctx->buf_cfg.use_poll != 0) {
+        query_srv_poll(pfile->sctx);
+    }
+    else {
+        query_srv_block(pfile->sctx);
+    }
+
+    logmsg(DEBUG, "Open finished.");
 
     pthread_mutex_unlock(&table_lck);
     return(os_fd);
@@ -1977,6 +2119,60 @@ rights_err:
 file_alloc_err:
     free(basename);
     return(-1);
+}
+
+/* System call wrapper for fcntl.                                           */
+int fcntl(int fildes, int cmd, ...) {
+    /* struct crdss_posix_file *pfile = NULL; */
+
+    /* if not done yet, initialize the table lock */
+    pthread_once(&table_lck_init, &setup_tbl_lck);
+
+    if (libc_fcntl == NULL)
+        libc_fcntl = dlsym(RTLD_NEXT, "fcntl");
+
+    /* fprintf(stderr, "Called fcntl!\n"); */
+
+    pthread_mutex_lock(&table_lck);
+    if (fd_table[fildes] == NULL) {
+        pthread_mutex_unlock(&table_lck);
+        int ret = -1;                               /* rc of real fcntl     */
+        va_list arglist;
+        void *arg;
+  
+        /* somehow the way below works for passing variadic arguments from  *
+         * one function to another, but I don't know if it's safe...        */
+        va_start(arglist, cmd);
+        arg = va_arg(arglist, void *);
+        logmsg(DEBUG, "Calling libc fcntl (fd %d, cmd %d).", fildes, cmd);
+        ret = libc_fcntl(fildes, cmd, arg);
+        va_end(arglist);
+        return(ret);
+    }
+
+    /* custom implementation, so far do nothing for CRDSS "files" */
+    pthread_mutex_unlock(&table_lck);
+    return(0);
+}
+
+/* system call wrapper for fdatasync                                        */
+int fdatasync(int fildes) {
+    if (libc_fdatasync == NULL)
+        libc_fdatasync = dlsym(RTLD_NEXT, "fdatasync");
+
+    if (fd_table[fildes] == NULL)
+        return(libc_fdatasync(fildes));
+   
+    logmsg(DEBUG, "Entering custom part of fdatasync (%d)!", fildes);
+    
+    if (libcrdss_sync(fd_table[fildes]->sctx, fd_table[fildes]->cap.dev_idx) != 
+        R_SUCCESS) {
+        /* sync op failed */
+        errno = EIO;
+        return(-1);
+    }
+
+    return(0);
 }
 
 /* wrapper for the close system call                                        */

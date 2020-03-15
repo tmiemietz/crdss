@@ -93,6 +93,9 @@ struct clt_lib_cfg {
 
     size_t lbuf_size;           /* size of large buffers in bytes           */    
     size_t lbuf_cnt;            /* number of large, on-demand allocated bufs*/          
+
+    int    use_poll;            /* flag that is set to 1 if the client's    *
+                                 * completion workers shall use polling     */
 };
 
 /****************************************************************************

@@ -18,10 +18,10 @@
 #include <stdlib.h>                         /* memory allocation            */
 #include <stdint.h>                         /* fixed-width integers         */
 #include <string.h>                         /* memset and friends           */
+#include <pthread.h>                        /* POSIX MT library             */
 #include <infiniband/verbs.h>               /* IB communication definitions */
 #include <errno.h>                          /* find out reasons for errors  */
 #include <arpa/inet.h>                      /* byte order conversion        */
-#include <time.h>                           /* for nanosleep                */
 #include <fcntl.h>                          /* set async fd to non-blocking */
 #include <poll.h>                           /* poll for async IB events     */
 
@@ -169,14 +169,14 @@ int init_clt_qp(struct ib_ctx *ibctx, uint64_t guid, unsigned char **msgbuf,
         return(1);
     }
     
-    logmsg(DEBUG, "Getting dev ctx.\n");
+    logmsg(DEBUG, "Getting dev ctx.");
     /* open the IB device identified by guid and save the port no. in ibctx */
     if (get_ctx_by_guid(ibctx, guid) != 0) {
         logmsg(ERROR, "Failed to open IB device with port GUID %#lx. "
                "Make sure that the GUID is correct...", guid);
         goto err_mem;
     }
-    logmsg(DEBUG, "dev ctx acquired.\n");
+    logmsg(DEBUG, "dev ctx acquired.");
    
     /* change the event fd of the device context to non-blocking            */
     flags = fcntl(ibctx->dev_ctx->async_fd, F_GETFL);
@@ -280,6 +280,8 @@ err_pd:
 err_mem:
     free(*msgbuf);
     free(*rdmabuf);
+    *msgbuf  = NULL;
+    *rdmabuf = NULL;
 
     return(1); 
 }
@@ -588,9 +590,6 @@ int destroy_ibctx(struct ib_ctx *ibctx) {
         return(1);
     }
 
-    /* acknowledge all outstanding events to prevent teardown op from blocking*/
-    ibv_ack_cq_events(ibctx->cq, ibctx->msg_cnt * 2);
-
     if (ibctx->qp != NULL && ibv_destroy_qp(ibctx->qp) != 0) {
         logmsg(ERROR, "Failed to destrox QP.");
         return(1);
@@ -635,6 +634,7 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
     struct ibv_wc cqe;                      /* completion entry             */
 
     while (poll_res == 0) {
+        logmsg(DEBUG, "get_ibmsg: Starting next receive loop.");
         memset(&cqe, 0, sizeof(struct ibv_wc));
 
         /* get the actual event from the CQ */
@@ -675,6 +675,7 @@ int get_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
 
         /* take the notification lock to avoid interference with other threads*/
         pthread_mutex_lock(&ibctx->notify_lck);
+        pthread_testcancel();
 
         /* get the actual event from the CQ */
         poll_res = ibv_poll_cq(ibctx->cq, 1, &cqe);
@@ -784,14 +785,10 @@ int poll_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
     struct ibv_async_event evt;             /* fields for querying IB events*/
     
     unsigned int i = 0;
-    struct timespec tspec;                  /* for cancellation purposes    */
 
     int poll_res = 0;                       /* result of IB poll function   */
 
     struct ibv_wc cqe;                      /* completion entry             */
-
-    tspec.tv_sec  = 0;                      /* short sleep for cancel check */
-    tspec.tv_nsec = 500;
 
     /* get the actual event from the CQ */
     while (poll_res == 0) {
@@ -827,7 +824,7 @@ int poll_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
          * context is shut down                                             */
         i++;
         if ((i % 1000) == 0) {
-            nanosleep(&tspec, NULL);
+            pthread_testcancel();
         }
     }
 
@@ -876,4 +873,11 @@ int poll_next_ibmsg(struct ib_ctx *ibctx, unsigned char **msg, uint32_t *imm) {
     }
 
     return(0);
+}
+
+/*  Function to call during clean up of a thread that uses get_next_ibmsg() */
+void worker_cleanup(void *ptr) {
+    struct ib_ctx *ibctx = (struct ib_ctx *) ptr;
+
+    pthread_mutex_unlock(&ibctx->notify_lck);
 }

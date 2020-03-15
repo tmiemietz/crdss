@@ -7,6 +7,8 @@
  ****************************************************************************/
 
 
+#pragma GCC diagnostic ignored "-Wclobbered"
+
 /****************************************************************************
  *                                                                          *
  *                           include statements                             *
@@ -1626,6 +1628,10 @@ static void *ib_worker(void *ctx) {
     uint64_t poll_field;                        /* doorbell address offset  */
 
     logmsg(DEBUG, "Handler %lu: Started IB worker thread.", handler->tid);
+    
+    /* register clean up function for blocking completion notifications     */
+    pthread_cleanup_push(&worker_cleanup, handler->ibctx);
+
     while (1) {
         if (get_next_msg_type(handler, &msg, &msg_type, &imm) != 0) {
             logmsg(ERROR, "Handler %lu: IB Worker: Error in InfiniBand "
@@ -1815,7 +1821,7 @@ static void *ib_worker(void *ctx) {
                 logmsg(DEBUG, "Handler %lu: RDMA offset is %lu, remote addr "
                        "is %lu.", handler->tid, rdma_offs, 
                        handler->ibctx->remote_addr);
-                
+            
                 /*
                 op_res = handle_read(handler, device_idx, slice_idx, saddr,
                                      length, rdma_offs);
@@ -1998,10 +2004,11 @@ static void *ib_worker(void *ctx) {
                     (uint64_t) handler->ibctx->remote_addr + imm) != 0) {
                     logmsg(ERROR, "Handler %lu: Failed to write poll field "
                            "for fast read completion.", handler->tid);
+                } 
+                else {
+                    logmsg(DEBUG, "Handler %lu: doorbell address written.",
+                           handler->tid);
                 }
-
-                logmsg(DEBUG, "Handler %lu: doorbell address written.",
-                       handler->tid);
 
                 break;
             case MTYPE_CPOLL:
@@ -2038,6 +2045,8 @@ static void *ib_worker(void *ctx) {
         }
     }
 
+    /* pop cleanup handler before leaving the function */
+    pthread_cleanup_pop(0);
     return(NULL);
 }
 
@@ -2172,13 +2181,20 @@ static void close_ib_conn(struct handler *handler) {
     /* kill InfiniBand worker threads */
     logmsg(DEBUG, "Handler %lu: Killing %u IB worker threads.", handler->tid,
            handler->worker_cnt);
+    /* cancel worker threads, they may wait on a notification mutex, so     *
+     * unlock it on every operation. This is not dangerous since the        *
+     * respective mutex is followed by an immediate call to                 *
+     * pthread_testcancel().                                                */
     for (i = 0; i < handler->worker_cnt; i++) {
         pthread_cancel(handler->ib_workers[i]);
+    }
+    for (i = 0; i < handler->worker_cnt; i++) {
         pthread_join(handler->ib_workers[i], &res);
     }
     free(handler->ib_workers);
     handler->ib_workers = NULL;
 
+    logmsg(DEBUG, "Handler %lu: Shutting down IB connection.", handler->tid);
     if (destroy_ibctx(handler->ibctx) != 0) {
         logmsg(WARN, "Handler %lu: Teardown of IB conn. failed.", 
                handler->tid);

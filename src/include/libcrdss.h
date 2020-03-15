@@ -20,6 +20,34 @@
 #define DEF_LIB_CFG_PATH "/home/mt/crdss/libcrdss.cfg"
 #define DEF_CAPMGR_SOCK  "/tmp/crdss-capmgr.sock"       /* capmgr dom. sock */
 
+/* worker ID for threads above the no_worker limit of the buffer config     */  
+#define WORKER_UNREG UINT16_MAX                                                 
+                                                                                
+/* size of a single cache line in Bytes (== size for doorbell fields)       */  
+#define CL_SIZE 512             /* for alignment of send buffers            */  
+                                                                                
+/* maximum file descriptor that can be used for CRDSS files                 */  
+#define LIBCRDSS_MAX_FD 1024                                                    
+                                                                                
+/* IB GUID for testing (make variable for release)                          */  
+#define LIBCRDSS_TEST_GUID "0xf45214030010a4e1"                                
+/* #define LIBCRDSS_TEST_GUID "0x0002c90300a27fc1" */                                
+                                                                                
+/* number of retries if send queue is full                                  */  
+#define LIBCRDSS_SQ_FRT 5                                                       
+                                                                                
+/* interval to wait between checks of doorbell register in us               */  
+#define LIBCRDSS_POLL_INT 2                                                     
+                                                                                
+/* interval to wait for retry of send operations if send queue was full [us]*/  
+#define LIBCRDSS_SR_RETRY_INT 10 
+
+/* no. of app threads per completion handler thread for polling completion  */
+#define LIBCRDSS_AT_PER_CW_POLL 3
+
+/* no. of app threads per completion handler thread for blocking completion */
+#define LIBCRDSS_AT_PER_CW_BLOCK 16
+
 /****************************************************************************   
  *                                                                          *   
  *                           include statements                             *   
@@ -63,11 +91,16 @@ struct crdss_srv_ctx {
     struct slist *avail_lbuf;       /* list of free large buffers           */
     pthread_mutex_t lbuf_lck;       /* mutex and cv to wait for free lbufs  */
     pthread_cond_t  lbuf_cv;
-
-    pthread_t compl_worker;         /* pointer to completion worker thread  */
+    
+    unsigned int cw_cnt;            /* no. of completion worker threads     */
+    pthread_t *compl_workers;       /* pointer to completion worker thread  */
     struct slist *wait_workers;     /* list of workers that wait for a CQE  */
     struct slist *unknown_compl;    /* completion for unknown workers       */
     pthread_mutex_t wait_lck;       /* lock for waiter list                 */
+
+    pthread_mutex_t *buf_lcks;      /* mutexes completion notification      */
+    pthread_cond_t  *buf_cvs:       /* CVs for completion notification      */
+    int *compl_flags;               /* flags for completion notification    */
 };
 
 /***        forwards declarations for library-internal data types         ***/
@@ -335,18 +368,32 @@ int read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
  * this function than there are large buffers, the calling threads will have
  * to wait for such a large buffer to become available.
  *
- * Params: ibctx      - IB context as yielded from the init_ib_comm routine.
- *         didx       - index of device to write to.
- *         sidx       - index of vslice to write to.
- *         saddr      - address inside vslice to write to.
- *         buf        - buffer provided by user that contains the data to be
- *                      written.
- *         len        - number of bytes to write.
+ * Params: sctx  - context of server connection.
+ *         didx  - index of device to write to.
+ *         sidx  - index of vslice to write to.
+ *         saddr - address inside vslice to write to.
+ *         buf   - buffer provided by user that contains the data to be
+ *                 written.
+ *         len   - number of bytes to write.
  *
  * Returns: The status of the operation, as defined in include/protocol.h.
  */
 int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
               uint64_t saddr, const void *buf, uint32_t len);
+
+/****************************************************************************
+ *
+ * Requests the server to sync all data of a certain device. The call will 
+ * fail if the client has not established an InfiniBand connection yet.
+ * Synchronization of devices currently does not need to be backed by 
+ * capabilities, so this call can not fail due to insufficient permissions.
+ *
+ * Params: sctx - server connection context.
+ *         didx - index of device to sync.
+ *
+ * Returns: the status of the operation as defined in include/protocol.h.
+ */
+int libcrdss_sync(struct crdss_srv_ctx *sctx, uint16_t didx);
 
 /***                     POSIX interface emulation                        ***/
 
