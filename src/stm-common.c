@@ -50,7 +50,7 @@ struct crdss_bdev *stm_open_dev(char *path) {
 
     /* in order to obtain realistic values for testing with the kernel, use *
      * O_DIRECT when opening files                                          */
-    if ((fd = open(path, O_RDWR /* | O_DIRECT */)) == -1) {
+    if ((fd = open(path, O_RDWR | O_DIRECT)) == -1) {
         logmsg(WARN, "Failed to open dev %s (%s), continuing...", path,
                strerror(errno));
         return(NULL);

@@ -54,14 +54,6 @@ struct wctx {
     uint32_t        tid;                /* TID of this worker               */
     uint16_t        wid;                /* libcrdss-internal worker ID for  *
                                          * the server context sctx (below)  */
-
-    pthread_mutex_t mtx;                /* for waking a worker at completion*/
-    pthread_cond_t  cv;
-
-    uint32_t next_key;                  /* next completion key to listen for*/
-    uint32_t  status;                   /* status of last request listened  */
-    unsigned char *msg;                 /* pointer to message buffer (RR)   */
-
     struct crdss_srv_ctx *sctx;         /* pointer to associated server ctx */
 };
 
@@ -126,7 +118,7 @@ static int (*libc_fdatasync)(int)                                 = NULL;
  * changing the parameters of init_logger.
  */
 static void setup_logger(void) {
-    init_logger("/dev/stderr", DEBUG);
+    init_logger("/dev/stderr", INFO);
 }
 
 /****************************************************************************
@@ -163,9 +155,6 @@ static void setup_tbl_lck(void) {
  */
 static void wctx_destructor(void *ctx) {
     struct wctx *work_ctx       = (struct wctx *) ctx;
-
-    pthread_mutex_destroy(&work_ctx->mtx);
-    pthread_cond_destroy(&work_ctx->cv);
 
     free(work_ctx);
 }
@@ -211,12 +200,6 @@ static struct wctx *get_wctx(struct crdss_srv_ctx *sctx) {
     if ((ctx = calloc(1, sizeof(struct wctx))) == NULL)
         return(NULL);
 
-    if (pthread_mutex_init(&ctx->mtx, NULL) != 0)
-        goto err_mtx;
-
-    if (pthread_cond_init(&ctx->cv, NULL) != 0)
-        goto err_cv;
-
     ctx->sctx = sctx;
     ctx->tid  = syscall(SYS_gettid);
     ctx->wid  = WORKER_UNREG;    /* mark worker as out-of-bounds by default */
@@ -248,12 +231,6 @@ static struct wctx *get_wctx(struct crdss_srv_ctx *sctx) {
 
     logmsg(DEBUG, "New worker id is: %u.", ctx->wid);
     return(ctx);
-
-err_cv:
-    pthread_mutex_destroy(&ctx->mtx);
-err_mtx:
-    free(ctx);
-    return(NULL);
 }
 
 /****************************************************************************
@@ -275,8 +252,6 @@ static void *completion_worker(void *ctx) {
     int               ret;              /* return value of get_next_ibmsg   */
     uint32_t          imm;              /* immediate received from message  */
 
-    struct slist *lptr;                 /* ptr for list iteration           */
-
     /* register clean up function for cancelling blocking completion calls  */
     pthread_cleanup_push(&worker_cleanup, &sctx->ibctx);
 
@@ -289,55 +264,31 @@ static void *completion_worker(void *ctx) {
         }
         
         /* ret = get_next_ibmsg(&sctx->ibctx, &msg, &imm); */
+        
+        if (ret != 0) {
+            logmsg(SEVERE, "Error on IB connection, terminating CW thread.");
+            pthread_exit(NULL);
+        }
+
         logmsg(DEBUG, "comp worker: got new message (imm = %u)!", imm);
 
-        pthread_mutex_lock(&sctx->wait_lck);
-        logmsg(DEBUG, "comp worker: trying %u wait entries.", 
-               slist_length(sctx->wait_workers));
-
-        /* try to find worker that wait for imm                             */
-        for (lptr = sctx->wait_workers; lptr != NULL; lptr = lptr->next) {
-            struct wctx *wcontext = (struct wctx *) lptr->data;
-
-            logmsg(DEBUG, "comp worker: trying entry %p.", (void *) wcontext);
-            logmsg(DEBUG, "comp worker: next key of worker is %u.", 
-                   wcontext->next_key);
-            if (imm == wcontext->next_key) {
-                wcontext->status = ret;
-                wcontext->msg    = msg;
-
-                sctx->wait_workers = slist_remove(sctx->wait_workers, wcontext);
-                pthread_mutex_unlock(&sctx->wait_lck);
-
-                pthread_mutex_lock(&wcontext->mtx);
-                pthread_cond_signal(&wcontext->cv);
-                pthread_mutex_unlock(&wcontext->mtx);
-
-                break;
-            }
+        /* check if imm (i.e., wake up key) is valid */
+        if (imm >= sctx->ibctx.msg_cnt) {
+            logmsg(WARN, "Completion worker: discarding invalid wake up key %u",
+                   imm);
+            continue;
         }
 
-        /* if no worker was found, insert message into the unknown list     */
-        if (lptr == NULL) {
-            struct wctx *wcontext = calloc(1, sizeof(struct wctx));
+        sctx->compl_ctxs[imm].status = ret;
+        sctx->compl_ctxs[imm].msg    = msg;
 
-            if (wcontext == NULL) {
-                pthread_mutex_unlock(&sctx->wait_lck);
-                continue;
-            }
+        /* if key is valid, broadcast to the respective condition variable  */
+        pthread_mutex_lock(&sctx->compl_ctxs[imm].mtx);
 
-            wcontext->next_key = imm;
-            wcontext->status   = ret;
-            wcontext->msg      = msg;
+        sctx->compl_ctxs[imm].compl_flag = 1;
+        pthread_cond_broadcast(&sctx->compl_ctxs[imm].cv);
 
-            if (slist_insert(&sctx->unknown_compl, wcontext) != 0) {
-                free(wcontext);
-                pthread_mutex_unlock(&sctx->wait_lck);
-                continue;
-            }
-        
-            pthread_mutex_unlock(&sctx->wait_lck);
-        }
+        pthread_mutex_unlock(&sctx->compl_ctxs[imm].mtx);
     }
 
     pthread_cleanup_pop(0);
@@ -348,66 +299,48 @@ static void *completion_worker(void *ctx) {
  *
  * Waits for an InfiniBand message with the message key specified. This is a
  * blocking operation and should not be used for latency-critical 
- * transmission of small messages. The function will queue the worker context
- * at the server's context. The completion handler thread for this server 
+ * transmission of small messages. The function will block on the completion
+ * context with the index passed as argument. 
+ * The completion handler threads for the server that wctx belongs to 
  * will wake the caller upon receiving an InfiniBand completion with the key
  * specified in this function. Upon return, the routine will store a pointer
  * to the message buffer as well as the completion status of the operation
- * in the worker context provided to this function.
+ * in the pointers passed to this function. Note that status ust point to a
+ * valid uint32_t variable.
  *
- * Params: wcontext - worker context of the calling thread.
- *         key      - message key to wait for.
+ * Params: sctx   - structure for a CRDSS session.
+ *         key    - message key to wait for.
+ *         status - pointer for storing the operation result.
+ *         msg    - pointer for referencing the received message.
  *
  * Returns: 0 on success, a negative integer for and internal error and a
  *          positive integer if the transmission of the message failed on IB
  *          level.
  */
-static int wait_for_ibmsg(struct wctx *wcontext, uint32_t key) {
-    struct slist *lptr;                 /* pointer for list iteration       */
+static int wait_for_ibmsg(struct crdss_srv_ctx *sctx, uint32_t key, 
+        uint32_t *status, unsigned char **msg) {
 
-    /* initialize worker context for next completion request */
-    wcontext->next_key = key;
-    wcontext->status   = -1;
-    wcontext->msg      = NULL;
-
-    pthread_mutex_lock(&wcontext->sctx->wait_lck);
-
-    logmsg(DEBUG, "wfibmsg: searching unknown list.");
-    for (lptr = wcontext->sctx->unknown_compl; lptr != NULL; lptr = lptr->next){
-        struct wctx *unknown = (struct wctx *) lptr->data;
-    
-        /* check if a completion occured meanwhile calling this function    */
-        if (unknown->next_key == key) {
-            logmsg(DEBUG, "wfibmsg: matching unknown entry found.");
-            wcontext->sctx->unknown_compl = 
-                slist_remove(wcontext->sctx->unknown_compl, unknown);
-
-            pthread_mutex_unlock(&wcontext->sctx->wait_lck);
-
-            wcontext->status = unknown->status;
-            wcontext->msg    = unknown->msg;
-
-            free(unknown);
-            return(wcontext->status);
-        }
+    /* check for out-of-bounds key */
+    if (key >= sctx->ibctx.msg_cnt) {
+        logmsg(WARN, "Invalid key in wait_for_ibmsg (%u).", key);
+        return(1);
     }
 
-    logmsg(DEBUG, "wfibmsg: inserting thread in wait list (key = %u ptr = %p).", 
-           wcontext->next_key, (void *) wcontext);
-    if (slist_insert(&wcontext->sctx->wait_workers, wcontext) != 0) {
-        pthread_mutex_unlock(&wcontext->sctx->wait_lck);
-        return(-1);
+    pthread_mutex_lock(&sctx->compl_ctxs[key].mtx);
+    
+    while (sctx->compl_ctxs[key].compl_flag == 0) {
+        pthread_cond_wait(&sctx->compl_ctxs[key].cv, 
+                          &sctx->compl_ctxs[key].mtx);
     }
 
-    /* locking order is important to avoid deadlocks or lost wakeups        */
-    pthread_mutex_lock(&wcontext->mtx);
-    pthread_mutex_unlock(&wcontext->sctx->wait_lck);
-    
-    /* wait for the completion worker to wake up this thread                */
-    pthread_cond_wait(&wcontext->cv, &wcontext->mtx);
-    pthread_mutex_unlock(&wcontext->mtx);
+    /* reset completion flag for next invocation */
+    sctx->compl_ctxs[key].compl_flag = 0;
+    pthread_mutex_unlock(&sctx->compl_ctxs[key].mtx);
 
-    return(wcontext->status);
+    *status = sctx->compl_ctxs[key].status;
+    *msg    = sctx->compl_ctxs[key].msg;
+
+    return(sctx->compl_ctxs[key].status);
 }
 
 /****************************************************************************
@@ -439,8 +372,7 @@ struct crdss_srv_ctx *create_srv_ctx(struct clt_lib_cfg *cfg) {
     if (pthread_mutex_init(&ctx->tcp_lck, NULL) != 0||
         pthread_mutex_init(&ctx->lbuf_lck, NULL) != 0 ||
         pthread_mutex_init(&ctx->id_lck, NULL) != 0 ||
-        pthread_cond_init(&ctx->lbuf_cv, NULL) != 0 ||
-        pthread_mutex_init(&ctx->wait_lck, NULL) != 0) {
+        pthread_cond_init(&ctx->lbuf_cv, NULL) != 0) {
         /* failed to init pthread structures */
         goto lock_err;
     }
@@ -483,7 +415,6 @@ lock_err:
     pthread_mutex_destroy(&ctx->lbuf_lck);
     pthread_mutex_destroy(&ctx->id_lck);
     pthread_cond_destroy(&ctx->lbuf_cv);
-    pthread_mutex_destroy(&ctx->wait_lck);
     free(ctx);
     return(NULL);
 }
@@ -703,6 +634,22 @@ int init_ib_comm(struct crdss_srv_ctx *sctx) {
      * is unlikely, we have to take care of this case to avoid IB queue stalls*/
     max_msg_cnt += sctx->buf_cfg.lbuf_cnt;
 
+    /* allocate and initialize completion contexts */
+    sctx->compl_ctxs = calloc(max_msg_cnt, sizeof(struct crdss_cctx));
+    if (sctx->compl_ctxs == NULL) {
+        pthread_mutex_unlock(&sctx->tcp_lck);
+        logmsg(ERROR, "Failed to allocate completion contexts.");
+        return(1);
+    }
+    for (i = 0; i < max_msg_cnt; i++) {
+        if (pthread_mutex_init(&sctx->compl_ctxs[i].mtx, NULL) != 0 ||
+            pthread_cond_init(&sctx->compl_ctxs[i].cv, NULL) != 0) {
+            pthread_mutex_unlock(&sctx->tcp_lck);
+            logmsg(ERROR, "Failed to initialize cctx locks.");
+            return(1);
+        }
+    }
+
     /* compute RDMA buffer size from buffer layout in sctx */
     rdma_size = sctx->buf_cfg.no_workers * CL_SIZE;   /* poll fields        */
     /* fast buffers for expected worker threads    */
@@ -858,6 +805,13 @@ int close_srv_conn(struct crdss_srv_ctx *sctx) {
         }
         logmsg(DEBUG, "Cancelled %u completion workers.", sctx->cw_cnt);
 
+        for (i = 0; i < sctx->ibctx.msg_cnt; i++) {
+            pthread_mutex_unlock(&sctx->compl_ctxs[i].mtx);
+            pthread_mutex_destroy(&sctx->compl_ctxs[i].mtx);
+            pthread_cond_destroy(&sctx->compl_ctxs[i].cv);
+        }
+        free(sctx->compl_ctxs);
+
         destroy_ibctx(&sctx->ibctx);
         logmsg(DEBUG, "Destroyed ibctx.");
         if (sctx->msg_buf != NULL)       free(sctx->msg_buf);
@@ -879,7 +833,6 @@ int close_srv_conn(struct crdss_srv_ctx *sctx) {
     pthread_mutex_destroy(&sctx->lbuf_lck);
     pthread_mutex_destroy(&sctx->id_lck);
     pthread_cond_destroy(&sctx->lbuf_cv);
-    pthread_mutex_destroy(&sctx->wait_lck);
 
     free(sctx->worker_ids);
     free(sctx);
@@ -924,17 +877,46 @@ int reg_cap(struct crdss_srv_ctx *sctx, unsigned char *capid) {
     }
     else {
         /* IB path */
+        uint32_t  key;                      /* message key to wait for      */
+        uint32_t  status;                   /* status of received message   */
+        uint64_t  rdma_addr = 0;            /* address of lbuf if used      */
+        unsigned char *recv_buf;            /* message buffer received      */
+
         pthread_mutex_unlock(&sctx->tcp_lck);
         work_ctx = get_wctx(sctx);
+
+        if (work_ctx->wid != WORKER_UNREG) {
+            /* use index of small buffer */
+            key = work_ctx->wid;
+        }
+        else {
+            /* allocate large buffer to use its key */
+            pthread_mutex_lock(&sctx->lbuf_lck);
+
+            while (slist_empty(sctx->avail_lbuf))
+                pthread_cond_wait(&sctx->lbuf_cv, &sctx->lbuf_lck);
+
+            rdma_addr        = (uint64_t) sctx->avail_lbuf->data;
+            sctx->avail_lbuf = slist_remove(sctx->avail_lbuf, 
+                                            sctx->avail_lbuf->data);
+
+            pthread_mutex_unlock(&sctx->lbuf_lck);
+
+            /* compute index from buffer addr */
+            key = ((rdma_addr - (uint64_t) sctx->rdma_buf - 
+                   sctx->buf_cfg.no_workers * 
+                   (CL_SIZE + sctx->buf_cfg.sbuf_size)) /
+                   sctx->buf_cfg.lbuf_size) + sctx->buf_cfg.no_workers;
+        }
 
         memset(msg_buf, 0, MAX_MSG_LEN);
         msg_buf[0] = MTYPE_REGCAP;
         memcpy(msg_buf + 1, capid, CAP_ID_LEN);
 
         logmsg(DEBUG, "reg_cap: sending request to the server.");
-        while ((op_res = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid)) == 
-               12) {
+        while ((op_res = post_msg_sr(&sctx->ibctx, msg_buf, key)) == 12) {
             logmsg(DEBUG, "reg_cap: waiting for free send queue.");
+            usleep(LIBCRDSS_SR_RETRY_INT);
         }
         if (op_res != 0) {
             /* failed to trigger IB send op. */
@@ -943,15 +925,28 @@ int reg_cap(struct crdss_srv_ctx *sctx, unsigned char *capid) {
         }
 
         logmsg(DEBUG, "reg_cap: waiting for answer of server.");
-        if (wait_for_ibmsg(work_ctx, work_ctx->tid) != 0) {
+        if (wait_for_ibmsg(sctx, key, &status, &recv_buf) != 0) {
             /* receive op failed */
             return(1);
         }
 
-        op_res = (uint8_t) work_ctx->msg[0];
+        op_res = (uint8_t) recv_buf[0];
         /* repost receive request */
-        if (post_msg_rr(&sctx->ibctx, work_ctx->msg, 1) != 0) {
+        if (post_msg_rr(&sctx->ibctx, recv_buf, 1) != 0) {
             return(1);
+        }
+
+        /* return large buffer if used */
+        if (work_ctx->wid == WORKER_UNREG) {
+            pthread_mutex_lock(&sctx->lbuf_lck);
+
+            if (slist_insert(&sctx->avail_lbuf, (void *) rdma_addr) != 0) {
+                pthread_mutex_unlock(&sctx->lbuf_lck);
+                return(1);
+            }
+
+            pthread_cond_signal(&sctx->lbuf_cv);
+            pthread_mutex_unlock(&sctx->lbuf_lck);
         }
 
         return(op_res);
@@ -995,16 +990,45 @@ int delete_rdom(struct crdss_srv_ctx *sctx, uint32_t rdom) {
     }
     else {
         /* IB path */
+        uint32_t  key;                      /* message key to wait for      */
+        uint32_t  status;                   /* status of received message   */
+        uint64_t  rdma_addr = 0;            /* address of lbuf if used      */
+        unsigned char *recv_buf;            /* message buffer received      */
+
         pthread_mutex_unlock(&sctx->tcp_lck);
         work_ctx = get_wctx(sctx);
+
+        if (work_ctx->wid != WORKER_UNREG) {
+            /* use index of small buffer */
+            key = work_ctx->wid;
+        }
+        else {
+            /* allocate large buffer to use its key */
+            pthread_mutex_lock(&sctx->lbuf_lck);
+
+            while (slist_empty(sctx->avail_lbuf))
+                pthread_cond_wait(&sctx->lbuf_cv, &sctx->lbuf_lck);
+
+            rdma_addr        = (uint64_t) sctx->avail_lbuf->data;
+            sctx->avail_lbuf = slist_remove(sctx->avail_lbuf, 
+                                            sctx->avail_lbuf->data);
+
+            pthread_mutex_unlock(&sctx->lbuf_lck);
+
+            /* compute index from buffer addr */
+            key = ((rdma_addr - (uint64_t) sctx->rdma_buf - 
+                   sctx->buf_cfg.no_workers * 
+                   (CL_SIZE + sctx->buf_cfg.sbuf_size)) /
+                   sctx->buf_cfg.lbuf_size) + sctx->buf_cfg.no_workers;
+        }
 
         memset(msg_buf, 0, MAX_MSG_LEN);
         msg_buf[0] = MTYPE_RMDOM;
         memcpy(msg_buf + 1, &rdom, sizeof(uint32_t));
 
-        while ((op_res = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid)) == 
-               12) {
+        while ((op_res = post_msg_sr(&sctx->ibctx, msg_buf, key)) == 12) {
             logmsg(DEBUG, "delete_rdom: waiting for free send queue.");
+            usleep(LIBCRDSS_SR_RETRY_INT);
         }
         if (op_res != 0) {
             /* failed to trigger IB send op. */
@@ -1012,15 +1036,28 @@ int delete_rdom(struct crdss_srv_ctx *sctx, uint32_t rdom) {
             return(1);
         }
 
-        if (wait_for_ibmsg(work_ctx, work_ctx->tid) != 0) {
+        if (wait_for_ibmsg(sctx, key, &status, &recv_buf) != 0) {
             /* receive op failed */
             return(1);
         }
 
-        op_res = (uint8_t) work_ctx->msg[0];
+        op_res = (uint8_t) recv_buf[0];
         /* repost receive request */
-        if (post_msg_rr(&sctx->ibctx, work_ctx->msg, 1) != 0) {
+        if (post_msg_rr(&sctx->ibctx, recv_buf, 1) != 0) {
             return(1);
+        }
+
+        /* return large buffer if used */
+        if (work_ctx->wid == WORKER_UNREG) {
+            pthread_mutex_lock(&sctx->lbuf_lck);
+
+            if (slist_insert(&sctx->avail_lbuf, (void *) rdma_addr) != 0) {
+                pthread_mutex_unlock(&sctx->lbuf_lck);
+                return(1);
+            }
+
+            pthread_cond_signal(&sctx->lbuf_cv);
+            pthread_mutex_unlock(&sctx->lbuf_lck);
         }
 
         return(op_res);
@@ -1035,6 +1072,11 @@ int libcrdss_sync(struct crdss_srv_ctx *sctx, uint16_t didx) {
     struct wctx *work_ctx = NULL;           /* worker context for this thrd */
     uint16_t didx_nw;                       /* didx in network byte order   */
 
+    uint32_t  key;                          /* message key to wait for      */
+    uint32_t  status;                       /* status of received message   */
+    uint64_t  rdma_addr = 0;                /* address of lbuf if used      */
+    unsigned char *recv_buf;                /* message buffer received      */
+    
     pthread_mutex_lock(&sctx->tcp_lck);
 
     if (sctx->msg_buf == NULL) {
@@ -1044,7 +1086,32 @@ int libcrdss_sync(struct crdss_srv_ctx *sctx, uint16_t didx) {
     }
 
     pthread_mutex_unlock(&sctx->tcp_lck);
+
     work_ctx = get_wctx(sctx);
+
+    if (work_ctx->wid != WORKER_UNREG) {
+        /* use index of small buffer */
+        key = work_ctx->wid;
+    }
+    else {
+        /* allocate large buffer to use its key */
+        pthread_mutex_lock(&sctx->lbuf_lck);
+
+        while (slist_empty(sctx->avail_lbuf))
+            pthread_cond_wait(&sctx->lbuf_cv, &sctx->lbuf_lck);
+
+        rdma_addr        = (uint64_t) sctx->avail_lbuf->data;
+        sctx->avail_lbuf = slist_remove(sctx->avail_lbuf, 
+                                        sctx->avail_lbuf->data);
+
+        pthread_mutex_unlock(&sctx->lbuf_lck);
+
+        /* compute index from buffer addr */
+        key = ((rdma_addr - (uint64_t) sctx->rdma_buf - 
+               sctx->buf_cfg.no_workers * 
+               (CL_SIZE + sctx->buf_cfg.sbuf_size)) /
+               sctx->buf_cfg.lbuf_size) + sctx->buf_cfg.no_workers;
+    }
     didx_nw  = htons(didx);
 
     memset(msg_buf, 0, MAX_MSG_LEN);
@@ -1052,7 +1119,7 @@ int libcrdss_sync(struct crdss_srv_ctx *sctx, uint16_t didx) {
     memcpy(msg_buf + 1, &didx_nw, sizeof(uint16_t));
 
     logmsg(DEBUG, "libcrdss_sync: sending request to the server.");
-    while ((op_res = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid)) == 12) {
+    while ((op_res = post_msg_sr(&sctx->ibctx, msg_buf, key)) == 12) {
         logmsg(DEBUG, "libcrdss_sync: waiting for free send queue.");
         usleep(LIBCRDSS_SR_RETRY_INT);
     }
@@ -1063,15 +1130,28 @@ int libcrdss_sync(struct crdss_srv_ctx *sctx, uint16_t didx) {
     }
 
     logmsg(DEBUG, "libcrdss_sync: waiting for answer of server.");
-    if (wait_for_ibmsg(work_ctx, work_ctx->tid) != 0) {
+    if (wait_for_ibmsg(sctx, key, &status, &recv_buf) != 0) {
         /* receive op failed */
         return(1);
     }
 
-    op_res = (uint8_t) work_ctx->msg[0];
+    op_res = (uint8_t) recv_buf[0];
     /* repost receive request */
-    if (post_msg_rr(&sctx->ibctx, work_ctx->msg, 1) != 0) {
+    if (post_msg_rr(&sctx->ibctx, recv_buf, 1) != 0) {
         return(1);
+    }
+
+    /* return large buffer if used */
+    if (work_ctx->wid == WORKER_UNREG) {
+        pthread_mutex_lock(&sctx->lbuf_lck);
+
+        if (slist_insert(&sctx->avail_lbuf, (void *) rdma_addr) != 0) {
+            pthread_mutex_unlock(&sctx->lbuf_lck);
+            return(1);
+        }
+
+        pthread_cond_signal(&sctx->lbuf_cv);
+        pthread_mutex_unlock(&sctx->lbuf_lck);
     }
 
     return(op_res);
@@ -1083,6 +1163,12 @@ int query_srv_poll(struct crdss_srv_ctx *sctx) {
     unsigned char msg_buf[MAX_MSG_LEN];     /* msg for IB transfer          */
     struct wctx *work_ctx = NULL;           /* worker context               */
 
+    uint32_t  key;                          /* message key to wait for      */
+    uint32_t  status;                       /* status of received message   */
+    uint64_t  rdma_addr = 0;                /* address of lbuf if used      */
+    unsigned char *recv_buf;                /* message buffer received      */
+
+
     pthread_mutex_lock(&sctx->tcp_lck);
 
     if (sctx->msg_buf == NULL) {
@@ -1098,27 +1184,63 @@ int query_srv_poll(struct crdss_srv_ctx *sctx) {
         return(1);
     }
 
+    if (work_ctx->wid != WORKER_UNREG) {
+        /* use index of small buffer */
+        key = work_ctx->wid;
+    }
+    else {
+        /* allocate large buffer to use its key */
+        pthread_mutex_lock(&sctx->lbuf_lck);
+
+        while (slist_empty(sctx->avail_lbuf))
+            pthread_cond_wait(&sctx->lbuf_cv, &sctx->lbuf_lck);
+
+        rdma_addr        = (uint64_t) sctx->avail_lbuf->data;
+        sctx->avail_lbuf = slist_remove(sctx->avail_lbuf, 
+                                        sctx->avail_lbuf->data);
+
+        pthread_mutex_unlock(&sctx->lbuf_lck);
+
+        /* compute index from buffer addr */
+        key = ((rdma_addr - (uint64_t) sctx->rdma_buf - 
+               sctx->buf_cfg.no_workers * 
+               (CL_SIZE + sctx->buf_cfg.sbuf_size)) /
+               sctx->buf_cfg.lbuf_size) + sctx->buf_cfg.no_workers;
+    }
+
     memset(msg_buf, 0, MAX_MSG_LEN);
     msg_buf[0] = MTYPE_CPOLL;
 
-    if (post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid) != 0) {
+    if (post_msg_sr(&sctx->ibctx, msg_buf, key) != 0) {
         logmsg(ERROR, "Can not send request to server.");
         /* failed to trigger IB send op. */
         return(1);
     }
 
-    if (wait_for_ibmsg(work_ctx, work_ctx->tid) != 0) {
+    if (wait_for_ibmsg(sctx, key, &status, &recv_buf) != 0) {
         /* receive op failed */
         logmsg(ERROR, "Unable to receive answer from server.");
-        post_msg_rr(&sctx->ibctx, work_ctx->msg, 1);
         return(1);
     }
 
-    op_res = (uint8_t) work_ctx->msg[0];
+    op_res = (uint8_t) recv_buf[0];
     /* repost receive request */
-    if (post_msg_rr(&sctx->ibctx, work_ctx->msg, 1) != 0) {
+    if (post_msg_rr(&sctx->ibctx, recv_buf, 1) != 0) {
         logmsg(WARN, "Failed to re-post receive request.");
         return(1);
+    }
+
+    /* return large buffer if used */
+    if (work_ctx->wid == WORKER_UNREG) {
+        pthread_mutex_lock(&sctx->lbuf_lck);
+
+        if (slist_insert(&sctx->avail_lbuf, (void *) rdma_addr) != 0) {
+            pthread_mutex_unlock(&sctx->lbuf_lck);
+            return(1);
+        }
+
+        pthread_cond_signal(&sctx->lbuf_cv);
+        pthread_mutex_unlock(&sctx->lbuf_lck);
     }
 
     return(op_res);
@@ -1130,6 +1252,11 @@ int query_srv_block(struct crdss_srv_ctx *sctx) {
     unsigned char msg_buf[MAX_MSG_LEN];     /* msg for IB transfer          */
     struct wctx *work_ctx = NULL;           /* worker context               */
 
+    uint32_t  key;                          /* message key to wait for      */
+    uint32_t  status;                       /* status of received message   */
+    uint64_t  rdma_addr = 0;                /* address of lbuf if used      */
+    unsigned char *recv_buf;                /* message buffer received      */
+
     pthread_mutex_lock(&sctx->tcp_lck);
 
     if (sctx->msg_buf == NULL) {
@@ -1145,23 +1272,63 @@ int query_srv_block(struct crdss_srv_ctx *sctx) {
         return(1);
     }
 
+    if (work_ctx->wid != WORKER_UNREG) {
+        /* use index of small buffer */
+        key = work_ctx->wid;
+    }
+    else {
+        /* allocate large buffer to use its key */
+        pthread_mutex_lock(&sctx->lbuf_lck);
+
+        while (slist_empty(sctx->avail_lbuf))
+            pthread_cond_wait(&sctx->lbuf_cv, &sctx->lbuf_lck);
+
+        rdma_addr        = (uint64_t) sctx->avail_lbuf->data;
+        sctx->avail_lbuf = slist_remove(sctx->avail_lbuf, 
+                                        sctx->avail_lbuf->data);
+
+        pthread_mutex_unlock(&sctx->lbuf_lck);
+
+        /* compute index from buffer addr */
+        key = ((rdma_addr - (uint64_t) sctx->rdma_buf - 
+               sctx->buf_cfg.no_workers * 
+               (CL_SIZE + sctx->buf_cfg.sbuf_size)) /
+               sctx->buf_cfg.lbuf_size) + sctx->buf_cfg.no_workers;
+    }
+
     memset(msg_buf, 0, MAX_MSG_LEN);
     msg_buf[0] = MTYPE_CBLOCK;
 
-    if (post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid) != 0) {
+    logmsg(DEBUG, "query_srv_block: sending msg to server (key = %u", key);
+    if (post_msg_sr(&sctx->ibctx, msg_buf, key) != 0) {
         /* failed to trigger IB send op. */
         return(1);
     }
 
-    if (wait_for_ibmsg(work_ctx, work_ctx->tid) != 0) {
+    if (wait_for_ibmsg(sctx, key, &status, &recv_buf) != 0) {
         /* receive op failed */
         return(1);
     }
 
-    op_res = (uint8_t) work_ctx->msg[0];
+    logmsg(DEBUG, "query_srv_block: received answer of server.");
+    op_res = (uint8_t) recv_buf[0];
     /* repost receive request */
-    if (post_msg_rr(&sctx->ibctx, work_ctx->msg, 1) != 0)
+    if (post_msg_rr(&sctx->ibctx, recv_buf, 1) != 0)
         return(1);
+
+    /* return large buffer if used */
+    if (work_ctx->wid == WORKER_UNREG) {
+        logmsg(DEBUG, "query_srv_block: returning lbuf.");
+        pthread_mutex_lock(&sctx->lbuf_lck);
+
+        if (slist_insert(&sctx->avail_lbuf, (void *) rdma_addr) != 0) {
+            pthread_mutex_unlock(&sctx->lbuf_lck);
+            return(1);
+        }
+
+        pthread_cond_signal(&sctx->lbuf_cv);
+        pthread_mutex_unlock(&sctx->lbuf_lck);
+    }
 
     return(op_res);
 }
@@ -1232,8 +1399,11 @@ int fast_read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
 
     /* get worker context. The function will fail if this thread is not reg.*/
     work_ctx = get_wctx(sctx);
-    if (work_ctx == NULL || work_ctx->wid == WORKER_UNREG)
+    if (work_ctx == NULL || work_ctx->wid == WORKER_UNREG) {
+        logmsg(ERROR, "Polling-based operations are reserved to registered "
+              "threads.");
         return(1);
+    }
 
     char_buf = (unsigned char *) buf;
 
@@ -1275,7 +1445,7 @@ int fast_read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
 
         /* logmsg(DEBUG, "TID of calling thread is %u.", work_ctx->tid); */
         logmsg(DEBUG, "fast_read_raw: sending request to server.");
-        while ((ret = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid)) == 12){
+        while ((ret = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->wid)) == 12){
             /* failed to post send request, but retry once SQ is polled     */
             usleep(LIBCRDSS_SR_RETRY_INT);
             /* pthread_yield(); */
@@ -1314,6 +1484,7 @@ int fast_write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
     uint32_t sidx_nw;
     uint64_t saddr_nw;
     uint32_t len_nw;
+
     uint64_t rdma_addr;             /* address in RDMA buffer (host bo.)    */
     uint64_t rdma_addr_nw;          /* address in RDMA buffer (nw byte ord.)*/
     uint64_t rdma_rem_addr;         /* target address in remote buffer      */
@@ -1329,8 +1500,11 @@ int fast_write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
 
     /* get worker context. The function will fail if this thread is not reg.*/
     work_ctx = get_wctx(sctx);
-    if (work_ctx == NULL || work_ctx->wid == WORKER_UNREG)
+    if (work_ctx == NULL || work_ctx->wid == WORKER_UNREG) {
+        logmsg(ERROR, "Polling-based operations are reserved to registered "
+               "threads.");
         return(1);
+    }
 
     char_buf = (unsigned char *) buf;
 
@@ -1389,7 +1563,7 @@ int fast_write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         }
 
         /* trigger the actual request at the server */
-        while ((ret = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid)) == 12){
+        while ((ret = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->wid)) == 12){
             /* failed to post send request, but retry once SQ is polled     */
             usleep(LIBCRDSS_SR_RETRY_INT);
             /* pthread_yield(); */
@@ -1427,6 +1601,7 @@ int read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
     uint32_t sidx_nw;
     uint64_t saddr_nw;
     uint32_t len_nw;
+    uint32_t chunk_size;            /* size of one data chunk transmitted   */
     uint64_t rdma_addr;             /* address in RDMA buffer (host bo.)    */
     uint64_t rdma_addr_nw;          /* address in RDMA buffer (nw byte ord.)*/
 
@@ -1436,6 +1611,11 @@ int read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
     uint32_t bytes_read   = 0;      /* number of bytes worked off           */
     struct wctx *work_ctx = NULL;   /* context of this worker thread        */
 
+    uint32_t  key;                          /* message key to wait for      */
+    uint32_t  status;                       /* status of received message   */
+    unsigned char *recv_buf;                /* message buffer received      */
+
+
     /* get worker context. The function will fail if this thread is not reg.*/
     work_ctx = get_wctx(sctx);
     if (work_ctx == NULL)
@@ -1443,18 +1623,36 @@ int read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
 
     char_buf = (unsigned char *) buf;
 
-    /* get buffer from the list of large buffers */
-    pthread_mutex_lock(&sctx->lbuf_lck);
+    /* if its large enough and we are a registered worker, use the threads  *
+     * small buffer since its acquisition does not take any locks           */
+    if (work_ctx->wid != WORKER_UNREG && len <= sctx->buf_cfg.sbuf_size) {
+        rdma_addr = (uint64_t) (sctx->rdma_buf + 
+                    sctx->buf_cfg.no_workers * CL_SIZE +
+                    work_ctx->wid * sctx->buf_cfg.sbuf_size);
 
-    while (slist_empty(sctx->avail_lbuf))
-        pthread_cond_wait(&sctx->lbuf_cv, &sctx->lbuf_lck);
+        key        = work_ctx->wid;
+        chunk_size = sctx->buf_cfg.sbuf_size;
+    }
+    else {
+        /* get buffer from the list of large buffers */
+        pthread_mutex_lock(&sctx->lbuf_lck);
 
-    rdma_addr        = (uint64_t) sctx->avail_lbuf->data;
-    sctx->avail_lbuf = slist_remove(sctx->avail_lbuf, sctx->avail_lbuf->data); 
+        while (slist_empty(sctx->avail_lbuf))
+            pthread_cond_wait(&sctx->lbuf_cv, &sctx->lbuf_lck);
 
-    pthread_mutex_unlock(&sctx->lbuf_lck);
+        rdma_addr        = (uint64_t) sctx->avail_lbuf->data;
+        sctx->avail_lbuf = slist_remove(sctx->avail_lbuf, 
+                                        sctx->avail_lbuf->data); 
 
-    logmsg(DEBUG, "read_raw: acquired RDMA buffer.");
+        pthread_mutex_unlock(&sctx->lbuf_lck);
+   
+        /* compute wake up key from buffer addr */
+        key = ((rdma_addr - (uint64_t) sctx->rdma_buf - 
+                sctx->buf_cfg.no_workers * (CL_SIZE + sctx->buf_cfg.sbuf_size))/
+                sctx->buf_cfg.lbuf_size) + sctx->buf_cfg.no_workers;
+
+        chunk_size = sctx->buf_cfg.lbuf_size;
+    }
 
     /* convert parameters to network byte order */
     didx_nw       = htons(didx);
@@ -1463,8 +1661,8 @@ int read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
 
     /* read in chunks until request is finished */
     while (len > 0) {
-        uint32_t cur_len = (len > sctx->buf_cfg.lbuf_size)
-                         ? sctx->buf_cfg.lbuf_size
+        uint32_t cur_len = (len > chunk_size)
+                         ? chunk_size
                          : len;
         
         saddr_nw = htobe64(saddr);
@@ -1478,23 +1676,23 @@ int read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         memcpy(msg_buf + 7, &saddr_nw, sizeof(uint64_t));
         memcpy(msg_buf + 15, &len_nw, sizeof(uint32_t));
         memcpy(msg_buf + 19, &rdma_addr_nw, sizeof(uint64_t));
-    
-        if (post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid) != 0) {
+   
+        if (post_msg_sr(&sctx->ibctx, msg_buf, key) != 0) {
             /* failed to post send request */
             return(R_FAILURE);
         }
 
         logmsg(DEBUG, "read_raw: Waiting for answer of server.");
         /* wait for answer of server */        
-        if (wait_for_ibmsg(work_ctx, work_ctx->tid) != 0) {
+        if (wait_for_ibmsg(sctx, key, &status, &recv_buf) != 0) {
             /* receive op failed */
             return(1);
         }
 
-        op_res = (work_ctx->status == IBV_WC_SUCCESS) ? R_SUCCESS : R_FAILURE;
+        op_res = (status == IBV_WC_SUCCESS) ? R_SUCCESS : R_FAILURE;
         logmsg(DEBUG, "read_raw: server status is %u.", op_res);
         /* repost receive request */
-        if (post_msg_rr(&sctx->ibctx, work_ctx->msg, 1) != 0) {
+        if (post_msg_rr(&sctx->ibctx, recv_buf, 1) != 0) {
             op_res = R_FAILURE;
             break;
         }
@@ -1510,16 +1708,18 @@ int read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         saddr      += cur_len;
     }
 
-    /* re-insert lbuf in list */
-    pthread_mutex_lock(&sctx->lbuf_lck);
+    /* re-insert lbuf in list (if used) */
+    if (work_ctx->wid == WORKER_UNREG || len > sctx->buf_cfg.sbuf_size) {
+        pthread_mutex_lock(&sctx->lbuf_lck);
 
-    if (slist_insert(&sctx->avail_lbuf, (void *) rdma_addr) != 0) {
+        if (slist_insert(&sctx->avail_lbuf, (void *) rdma_addr) != 0) {
+            pthread_mutex_unlock(&sctx->lbuf_lck);
+            return(1);
+        }
+
+        pthread_cond_signal(&sctx->lbuf_cv);
         pthread_mutex_unlock(&sctx->lbuf_lck);
-        return(1);
     }
-
-    pthread_cond_signal(&sctx->lbuf_cv);
-    pthread_mutex_unlock(&sctx->lbuf_lck);
 
     return(op_res);
 }
@@ -1533,6 +1733,7 @@ int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
     uint32_t sidx_nw;
     uint64_t saddr_nw;
     uint32_t len_nw;
+    uint32_t chunk_size;            /* size of one data chunk transmitted   */
     uint64_t rdma_addr;             /* address in RDMA buffer (host bo.)    */
     uint64_t rdma_addr_nw;          /* address in RDMA buffer (nw byte ord.)*/
     uint64_t rdma_rem_addr;         /* target address in remote buffer      */
@@ -1543,24 +1744,49 @@ int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
     uint32_t bytes_written = 0;     /* number of bytes worked off           */
     struct wctx *work_ctx  = NULL;  /* context of this worker thread        */
 
+    uint32_t  key;                          /* message key to wait for      */
+    uint32_t  status;                       /* status of received message   */
+    unsigned char *recv_buf;                /* message buffer received      */
+
+
     /* get worker context. The function will fail if this thread is not reg.*/
     work_ctx = get_wctx(sctx);
-    if (work_ctx == NULL || work_ctx->wid == WORKER_UNREG)
+    if (work_ctx == NULL)
         return(1);
 
     char_buf = (unsigned char *) buf;
 
-    /* get buffer from the list of large buffers */
-    pthread_mutex_lock(&sctx->lbuf_lck);
+    /* if its large enough and we are a registered worker, use the threads  *
+     * small buffer since its acquisition does not take any locks           */
+    if (work_ctx->wid != WORKER_UNREG && len <= sctx->buf_cfg.sbuf_size) {
+        rdma_addr = (uint64_t) (sctx->rdma_buf + 
+                    sctx->buf_cfg.no_workers * CL_SIZE +
+                    work_ctx->wid * sctx->buf_cfg.sbuf_size);
 
-    while (slist_empty(sctx->avail_lbuf))
-        pthread_cond_wait(&sctx->lbuf_cv, &sctx->lbuf_lck);
+        key        = work_ctx->wid;
+        chunk_size = sctx->buf_cfg.sbuf_size;
+    }
+    else {
+        /* get buffer from the list of large buffers */
+        pthread_mutex_lock(&sctx->lbuf_lck);
 
-    rdma_addr        = (uint64_t) sctx->avail_lbuf->data;
-    sctx->avail_lbuf = slist_remove(sctx->avail_lbuf, sctx->avail_lbuf->data); 
+        while (slist_empty(sctx->avail_lbuf))
+            pthread_cond_wait(&sctx->lbuf_cv, &sctx->lbuf_lck);
 
-    pthread_mutex_unlock(&sctx->lbuf_lck);
-    
+        rdma_addr        = (uint64_t) sctx->avail_lbuf->data;
+        sctx->avail_lbuf = slist_remove(sctx->avail_lbuf, 
+                                        sctx->avail_lbuf->data); 
+
+        pthread_mutex_unlock(&sctx->lbuf_lck);
+   
+        /* compute wake up key from buffer addr */
+        key = ((rdma_addr - (uint64_t) sctx->rdma_buf - 
+                sctx->buf_cfg.no_workers * (CL_SIZE + sctx->buf_cfg.sbuf_size))/
+                sctx->buf_cfg.lbuf_size) + sctx->buf_cfg.no_workers;
+
+        chunk_size = sctx->buf_cfg.lbuf_size;
+    }
+
     /* compute addresses for small buffers and doorbell addresses           */
     rdma_rem_addr = (rdma_addr - (uint64_t) sctx->rdma_buf) + 
                     sctx->ibctx.remote_addr; 
@@ -1572,8 +1798,8 @@ int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
 
     /* read in chunks until request is finished */
     while (len > 0) {
-        uint32_t cur_len = (len > sctx->buf_cfg.lbuf_size)
-                         ? sctx->buf_cfg.lbuf_size
+        uint32_t cur_len = (len > chunk_size)
+                         ? chunk_size
                          : len;
        
         /* copy data to RDMA buffer */
@@ -1594,38 +1820,38 @@ int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         /* transfer data, afterwards send the actual request */
         if (init_rdma_transfer(&sctx->ibctx, (unsigned char *) rdma_addr,
                                (unsigned char *) rdma_rem_addr, cur_len, 
-                               0, work_ctx->tid, 1) != 0) {
+                               0, key, 1) != 0) {
             return(R_FAILURE);
         }
 
         /* wait for RDMA transfer to complete */        
-        if (wait_for_ibmsg(work_ctx, work_ctx->tid) != 0) {
+        if (wait_for_ibmsg(sctx, key, &status, &recv_buf) != 0) {
             /* receive op failed */
             return(1);
         }
         logmsg(DEBUG, "write_raw: data transfer complete, sending msg.");
 
-        op_res = (work_ctx->status == IBV_WC_SUCCESS) ? R_SUCCESS : R_FAILURE;
+        op_res = (status == IBV_WC_SUCCESS) ? R_SUCCESS : R_FAILURE;
         /* we do not actually receive a message, hence do not repost an RR  */
 
         if (op_res != R_SUCCESS)
             break;
 
         /* send actual request to server */
-        if (post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->tid) != 0) {
+        if (post_msg_sr(&sctx->ibctx, msg_buf, key) != 0) {
             /* failed to post send request */
             return(R_FAILURE);
         }
 
         /* wait for answer of server */        
-        if (wait_for_ibmsg(work_ctx, work_ctx->tid) != 0) {
+        if (wait_for_ibmsg(sctx, key, &status, &recv_buf) != 0) {
             /* receive op failed */
             return(1);
         }
 
-        op_res = (work_ctx->status == IBV_WC_SUCCESS) ? R_SUCCESS : R_FAILURE;
+        op_res = (uint8_t) recv_buf[0];
         /* repost receive request */
-        if (post_msg_rr(&sctx->ibctx, work_ctx->msg, 1) != 0) {
+        if (post_msg_rr(&sctx->ibctx, recv_buf, 1) != 0) {
             op_res = R_FAILURE;
             break;
         }
@@ -1641,17 +1867,19 @@ int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         saddr         += cur_len;
     }
 
-    /* re-insert lbuf in list */
-    pthread_mutex_lock(&sctx->lbuf_lck);
+    /* re-insert lbuf in list (if used) */
+    if (work_ctx->wid == WORKER_UNREG || len > sctx->buf_cfg.sbuf_size) {
+        pthread_mutex_lock(&sctx->lbuf_lck);
 
-    if (slist_insert(&sctx->avail_lbuf, (void *) rdma_addr) != 0) {
+        if (slist_insert(&sctx->avail_lbuf, (void *) rdma_addr) != 0) {
+            pthread_mutex_unlock(&sctx->lbuf_lck);
+            return(1);
+        }
+
+        pthread_cond_signal(&sctx->lbuf_cv);
         pthread_mutex_unlock(&sctx->lbuf_lck);
-        return(1);
     }
 
-    pthread_cond_signal(&sctx->lbuf_cv);
-    pthread_mutex_unlock(&sctx->lbuf_lck);
-    
     return(op_res);
 }
 
@@ -1672,29 +1900,22 @@ ssize_t pread64(int fd, void *buf, size_t count, off_t offset) {
         return(libc_pread64(fd, buf, count, offset));
 
     /* else: use crdss functions for reading data */
-    if (count <= fd_table[fd]->sctx->buf_cfg.sbuf_size && 
-        get_wctx(fd_table[fd]->sctx) != NULL) {
+    if (fd_table[fd]->sctx->buf_cfg.use_poll != 0) {
         /* use small buffers for data transmission */
         /* logmsg(DEBUG, "starting read op."); */
         ret = fast_read_raw(fd_table[fd]->sctx, fd_table[fd]->cap.dev_idx,
                             fd_table[fd]->cap.vslc_idx, (uint64_t) offset, buf,
                             count);
 
-        logmsg(DEBUG, "finished read op (%d)", ret);
-        if (ret != 0) {
-            errno = EIO;
-            return(-1);
-        }
-        else {
-            return(count);
-        }
+        logmsg(DEBUG, "finished fast read op (%d)", ret);
     }
-
-    /* use large buffers for data transmission */
-    ret = read_raw(fd_table[fd]->sctx, fd_table[fd]->cap.dev_idx,
-                   fd_table[fd]->cap.vslc_idx, (uint64_t) offset, buf,
-                   count);
-    logmsg(DEBUG, "finished block read op.");
+    else {
+        /* use large buffers for data transmission */
+        ret = read_raw(fd_table[fd]->sctx, fd_table[fd]->cap.dev_idx,
+                       fd_table[fd]->cap.vslc_idx, (uint64_t) offset, buf,
+                       count);
+        logmsg(DEBUG, "finished blocking read op (%d).", ret);
+    }
 
     if (ret != 0) {
         errno = EIO;
@@ -1718,26 +1939,18 @@ ssize_t pwrite64(int fd, const void *buf, size_t nbyte, off_t offset) {
         return(libc_pwrite64(fd, buf, nbyte, offset));
 
     /* else: use crdss functions for reading data */
-    if (nbyte <= fd_table[fd]->sctx->buf_cfg.sbuf_size && 
-        get_wctx(fd_table[fd]->sctx) != NULL) {
+    if (fd_table[fd]->sctx->buf_cfg.use_poll != 0) {
         /* use small buffers for data transmission */
         ret = fast_write_raw(fd_table[fd]->sctx, fd_table[fd]->cap.dev_idx,
                              fd_table[fd]->cap.vslc_idx, (uint64_t) offset, buf,
                              nbyte);
-
-        if (ret != 0) {
-            errno = EIO;
-            return(-1);
-        }
-        else {
-            return(nbyte);
-        }
     }
-
-    /* use large buffers for data transmission */
-    ret = write_raw(fd_table[fd]->sctx, fd_table[fd]->cap.dev_idx,
-                    fd_table[fd]->cap.vslc_idx, (uint64_t) offset, buf,
-                    nbyte);
+    else {
+        /* use large buffers for data transmission */
+        ret = write_raw(fd_table[fd]->sctx, fd_table[fd]->cap.dev_idx,
+                        fd_table[fd]->cap.vslc_idx, (uint64_t) offset, buf,
+                        nbyte);
+    }
 
     if (ret != 0) {
         errno = EIO;
@@ -1965,7 +2178,7 @@ int open64(const char *pathname, int flags, ...) {
         return(ret);
     }
 
-    fprintf(stderr, "Entering custom part of open64 (%s)!\n", basename);
+    /* fprintf(stderr, "Entering custom part of open64 (%s)!\n", basename); */
 
     /* lock fd table to avoid race conditions */
     pthread_mutex_lock(&table_lck);

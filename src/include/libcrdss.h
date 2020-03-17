@@ -17,7 +17,7 @@
  ****************************************************************************/
 
 
-#define DEF_LIB_CFG_PATH "/home/mt/crdss/libcrdss.cfg"
+#define DEF_LIB_CFG_PATH "/home/ib/crdss/libcrdss.cfg"
 #define DEF_CAPMGR_SOCK  "/tmp/crdss-capmgr.sock"       /* capmgr dom. sock */
 
 /* worker ID for threads above the no_worker limit of the buffer config     */  
@@ -30,8 +30,8 @@
 #define LIBCRDSS_MAX_FD 1024                                                    
                                                                                 
 /* IB GUID for testing (make variable for release)                          */  
-#define LIBCRDSS_TEST_GUID "0xf45214030010a4e1"                                
-/* #define LIBCRDSS_TEST_GUID "0x0002c90300a27fc1" */                                
+/* #define LIBCRDSS_TEST_GUID "0xf45214030010a4e1" */                               
+#define LIBCRDSS_TEST_GUID "0x0002c90300a27fc1"                                
                                                                                 
 /* number of retries if send queue is full                                  */  
 #define LIBCRDSS_SQ_FRT 5                                                       
@@ -43,7 +43,7 @@
 #define LIBCRDSS_SR_RETRY_INT 10 
 
 /* no. of app threads per completion handler thread for polling completion  */
-#define LIBCRDSS_AT_PER_CW_POLL 3
+#define LIBCRDSS_AT_PER_CW_POLL 2
 
 /* no. of app threads per completion handler thread for blocking completion */
 #define LIBCRDSS_AT_PER_CW_BLOCK 16
@@ -70,6 +70,20 @@
  ****************************************************************************/
 
 
+/* context that is used for waiting for a completion notification from a    *
+ * completion worker thread. Each buffer allocated (both small bufs and     *
+ * large bufs) have a completion context that obsoletes using a global list *
+ * for threads that are waiting for a notification.                         */
+struct crdss_cctx {
+    pthread_mutex_t mtx;            /* mutex for protection of CV and flag  */
+    pthread_cond_t  cv;             /* CV for waiting on notifications      */
+    int compl_flag;                 /* 1 if an event for this ctx occurred  */
+
+    uint32_t status;                /* status of last receive operation     */
+    unsigned char *msg;             /* actual (control) message received, to*
+                                     * be requeued as RR after handling msg */
+};
+
 /* mantle structure for a connection to a server, seen from the client side */
 struct crdss_srv_ctx {
     struct sockaddr_in srv_addr;    /* IP address and port of server        */
@@ -94,16 +108,11 @@ struct crdss_srv_ctx {
     
     unsigned int cw_cnt;            /* no. of completion worker threads     */
     pthread_t *compl_workers;       /* pointer to completion worker thread  */
-    struct slist *wait_workers;     /* list of workers that wait for a CQE  */
-    struct slist *unknown_compl;    /* completion for unknown workers       */
-    pthread_mutex_t wait_lck;       /* lock for waiter list                 */
 
-    pthread_mutex_t *buf_lcks;      /* mutexes completion notification      */
-    pthread_cond_t  *buf_cvs:       /* CVs for completion notification      */
-    int *compl_flags;               /* flags for completion notification    */
+    struct crdss_cctx *compl_ctxs;  /* array of completion contexts for not.*/
 };
 
-/***        forwards declarations for library-internal data types         ***/
+/***         forward declarations for library-internal data types         ***/
 struct stat64;
 
 /****************************************************************************
