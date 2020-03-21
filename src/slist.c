@@ -44,7 +44,7 @@ int slist_insert(struct slist **list, void *elem) {
 int slist_append(struct slist **list, void *elem) {
     struct slist *iter_ptr;
 
-    struct slist *new = calloc((size_t ) 1, sizeof(struct slist));
+    struct slist *new = calloc((size_t) 1, sizeof(struct slist));
     if (new == NULL)
         return(1);
 
@@ -59,7 +59,7 @@ int slist_append(struct slist **list, void *elem) {
     while (iter_ptr->next != NULL)
         iter_ptr = iter_ptr->next;
 
-    iter_ptr->next = elem;
+    iter_ptr->next = new;
     return(0);
 }
 

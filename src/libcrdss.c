@@ -101,7 +101,7 @@ static int (*libc_open64)(const char *, int, ...)                 = NULL;
 static int (*libc_fcntl)(int, int, ...)                           = NULL;
 static int (*libc_fdatasync)(int)                                 = NULL;       
 /* enabling the custom close function for now still causes deadlocks...     */
-/* static int (*libc_close)(int)                                     = NULL; */
+static int (*libc_close)(int)                                     = NULL;
 
 /****************************************************************************
  *                                                                          *
@@ -1677,16 +1677,20 @@ int read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         memcpy(msg_buf + 15, &len_nw, sizeof(uint32_t));
         memcpy(msg_buf + 19, &rdma_addr_nw, sizeof(uint64_t));
    
-        if (post_msg_sr(&sctx->ibctx, msg_buf, key) != 0) {
-            /* failed to post send request */
-            return(R_FAILURE);
+        while ((op_res = post_msg_sr(&sctx->ibctx, msg_buf, key)) == 12) {
+            usleep(LIBCRDSS_SR_RETRY_INT);
+        }
+
+        if (op_res != 0) {
+            logmsg(ERROR, "read_raw: Failed to send request to server.");
+            return(1);
         }
 
         logmsg(DEBUG, "read_raw: Waiting for answer of server.");
         /* wait for answer of server */        
         if (wait_for_ibmsg(sctx, key, &status, &recv_buf) != 0) {
             /* receive op failed */
-            return(1);
+            return(R_FAILURE);
         }
 
         op_res = (status == IBV_WC_SUCCESS) ? R_SUCCESS : R_FAILURE;
@@ -1818,35 +1822,38 @@ int write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         memcpy(msg_buf + 19, &rdma_addr_nw, sizeof(uint64_t));
     
         /* transfer data, afterwards send the actual request */
-        if (init_rdma_transfer(&sctx->ibctx, (unsigned char *) rdma_addr,
-                               (unsigned char *) rdma_rem_addr, cur_len, 
-                               0, key, 1) != 0) {
+        while ((op_res = init_rdma_transfer(&sctx->ibctx, 
+                             (unsigned char *) rdma_addr,
+                             (unsigned char *) rdma_rem_addr, cur_len, 
+                             0, key, 0)) == 12) {
+            usleep(LIBCRDSS_SR_RETRY_INT);
+        }
+
+        if (op_res != 0) {
+            logmsg(ERROR, "write_raw: Failed to transmit data buffer.");
             return(R_FAILURE);
         }
 
-        /* wait for RDMA transfer to complete */        
-        if (wait_for_ibmsg(sctx, key, &status, &recv_buf) != 0) {
-            /* receive op failed */
-            return(1);
-        }
-        logmsg(DEBUG, "write_raw: data transfer complete, sending msg.");
-
-        op_res = (status == IBV_WC_SUCCESS) ? R_SUCCESS : R_FAILURE;
-        /* we do not actually receive a message, hence do not repost an RR  */
-
-        if (op_res != R_SUCCESS)
-            break;
+        /* we do not have to wait for the data transfer to complete, since   *
+         * wait wait for an IB message below. In case the data transfer      *
+         * failed, the subsequent write request will fail as well (due to    *
+         * the way in that RC queue pairs work). Hence, there is no chance   *
+         * of invalid data being written to a server's SSD                   */        
 
         /* send actual request to server */
-        if (post_msg_sr(&sctx->ibctx, msg_buf, key) != 0) {
-            /* failed to post send request */
+        while ((op_res = post_msg_sr(&sctx->ibctx, msg_buf, key)) == 12) {
+            usleep(LIBCRDSS_SR_RETRY_INT);
+        }
+
+        if (op_res != 0) {
+            logmsg(ERROR, "write_raw_ Failed to send request to server.");
             return(R_FAILURE);
         }
 
         /* wait for answer of server */        
         if (wait_for_ibmsg(sctx, key, &status, &recv_buf) != 0) {
             /* receive op failed */
-            return(1);
+            return(R_FAILURE);
         }
 
         op_res = (uint8_t) recv_buf[0];
@@ -2389,16 +2396,18 @@ int fdatasync(int fildes) {
 }
 
 /* wrapper for the close system call                                        */
-/*
 int close(int fd) {
     if (libc_close == NULL)
         libc_close = dlsym(RTLD_NEXT, "close");
-    fprintf(stderr, "Called close for fd %d!\n", fd);
-
+    
     pthread_mutex_lock(&table_lck);
     if (fd_table[fd] != NULL) {
-        fd_table[fd]->ref_cnt = fd_table[fd]->ref_cnt - 1;
-        if (fd_table[fd]->ref_cnt == 0) { */
+        logmsg(DEBUG, "Called close() for CRDSS session with fd %d.", fd);
+
+        if (fd_table[fd]->ref_cnt > 0)
+            fd_table[fd]->ref_cnt = fd_table[fd]->ref_cnt - 1;
+        
+        if (fd_table[fd]->ref_cnt == 0) { 
             /* tear down server connection */
             /*
             fprintf(stderr, "destroying custom data structure (fd = %d).\n", 
@@ -2409,9 +2418,14 @@ int close(int fd) {
             fd_table[fd] = NULL;
             fprintf(stderr, "destruction of fd %d done, calling close(2).\n", 
                     fd);
+            */
+            logmsg(INFO, "close() is not yet fully implemented.");
         }
+
+        pthread_mutex_unlock(&table_lck);
+        return(0);
     }
     pthread_mutex_unlock(&table_lck);
 
     return(libc_close(fd));
-} */
+}

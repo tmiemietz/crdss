@@ -347,7 +347,7 @@ static int relay_vslcinfo(unsigned char *msg_buf, struct ucred *creds,
     }
 
     logmsg(DEBUG, "Filling intermediate request struct.");
-    if ((new_req = malloc(sizeof(struct clt_req))) == NULL) {
+    if ((new_req = calloc(1, sizeof(struct clt_req))) == NULL) {
         pthread_mutex_unlock(&srv_lck);
         logmsg(WARN, "Memory allocation for new request failed.");
         return(1);
@@ -365,7 +365,7 @@ static int relay_vslcinfo(unsigned char *msg_buf, struct ucred *creds,
 
     pthread_mutex_lock(&srv->req_lck);
 
-    if (slist_append(&srv->requests, new_req) ||
+    if (slist_append(&srv->requests, new_req) != 0 ||
         send(srv->sock_fd, &opcode, 1, 0) < 1 ||
         send(srv->sock_fd, &dev_idx, 2, 0) < 2 ||
         send(srv->sock_fd, &vslc_idx, 4, 0) < 4) {
@@ -532,7 +532,7 @@ static int relay_mkcap2(unsigned char *msg_buf, struct ucred *creds,
 
     pthread_mutex_lock(&srv->req_lck);
 
-    if (slist_append(&srv->requests, new_req) ||
+    if (slist_append(&srv->requests, new_req) != 0 ||
         send(srv->sock_fd, &opcode, 1, 0) < 1 ||
         send_cap_to_sock(srv->sock_fd, new_cap->dev_idx, new_cap->vslc_idx,
                 new_cap->start_addr, new_cap->end_addr, new_cap->rights)) {

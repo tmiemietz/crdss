@@ -33,8 +33,8 @@
 /* #define LIBCRDSS_TEST_GUID "0xf45214030010a4e1" */                               
 #define LIBCRDSS_TEST_GUID "0x0002c90300a27fc1"                                
                                                                                 
-/* number of retries if send queue is full                                  */  
-#define LIBCRDSS_SQ_FRT 5                                                       
+/* number of retries if send queue is full (currently, no timeouts active)  */  
+/* #define LIBCRDSS_SQ_FRT 5 */                                                      
                                                                                 
 /* interval to wait between checks of doorbell register in us               */  
 #define LIBCRDSS_POLL_INT 2                                                     
