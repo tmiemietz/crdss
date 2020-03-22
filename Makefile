@@ -10,7 +10,7 @@ OBJDIR := obj
 INCDIR := src/include
 
 TGTDIR := bin
-TGTS   := crdss-srv crdss-capmgr libcrdss testclt crdss-srv-dummy gap_read gap_read_cap sqlite_bench
+TGTS   := crdss-srv crdss-capmgr libcrdss testclt crdss-srv-dummy gap_read gap_read_cap sqlite_bench crdss-cp crdss-rd
 
 LIBS   := -lpthread -lsodium -libverbs -ldl
 
@@ -42,6 +42,14 @@ testclt: obj/testclt.o $(filter-out $(TGTOBJS), $(OBJECTS))
 	$(CC) -pedantic -o $(TGTDIR)/$@ -Llib $^ $(LIBS) -lcrdss
 
 gap_read: obj/gap_read.o $(filter-out $(TGTOBJS), $(OBJECTS))
+	@echo "Linking $@..."
+	$(CC) -pedantic -o $(TGTDIR)/$@ $^ $(LIBS)
+
+crdss-cp: obj/crdss-cp.o $(filter-out $(TGTOBJS), $(OBJECTS))
+	@echo "Linking $@..."
+	$(CC) -pedantic -o $(TGTDIR)/$@ $^ $(LIBS)
+
+crdss-rd: obj/crdss-rd.o $(filter-out $(TGTOBJS), $(OBJECTS))
 	@echo "Linking $@..."
 	$(CC) -pedantic -o $(TGTDIR)/$@ $^ $(LIBS)
 

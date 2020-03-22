@@ -2809,6 +2809,7 @@ static void join_handlers(void) {
 int main(int argc, char **argv) {
     int next_opt;                   /* value of next cli option             */
     int wflag = 0;
+    int iflag = 0;
     int rc;                         /* error code for reporting             */
 
     char *logdir   = NULL;          /* directory of log file                */
@@ -2816,7 +2817,7 @@ int main(int argc, char **argv) {
     char *confpath = NULL;          /* path to config file                  */
 
     /* parse command line arguments */
-    while ((next_opt = getopt(argc, argv, ":c:l:wh")) != -1) {
+    while ((next_opt = getopt(argc, argv, ":c:l:whi")) != -1) {
         switch (next_opt) {
             case 'c':
                 confpath = optarg;
@@ -2848,6 +2849,9 @@ int main(int argc, char **argv) {
                 continue;
             case 'w':
                 wflag = 1;
+                continue;
+            case 'i':
+                iflag = 1;
                 continue;
             case ':':
                 fprintf(stderr, "Missing argument for option -%c\n", optopt);
@@ -2937,7 +2941,7 @@ int main(int argc, char **argv) {
 
     /*** !!! ONLY TEMPORARILY FOR TESTING !!! ***/
     /* init first block device with a static stm */
-    if (devs != NULL) {
+    if (devs != NULL && iflag == 1) {
         logmsg(WARN, "Destroying data layout for testing...");
         sstm_init((struct crdss_bdev *) devs->data, 2);
         sstm_mkvslc((struct crdss_bdev *) devs->data);

@@ -962,6 +962,9 @@ static int handle_write(struct handler *handler, uint16_t didx, uint32_t sidx,
         return(R_PERM);
     }
 
+    logmsg(DEBUG, "Handler %lu: Executing write request (didx = %u, sidx = %u, "
+           "addr = %lu, len = %u).", handler->tid, didx, sidx, addr, len);
+
     lptr = devs;
     for (i = 0; i < didx; i++)
         lptr = lptr->next;
@@ -983,7 +986,7 @@ static int handle_write(struct handler *handler, uint16_t didx, uint32_t sidx,
         rlen = (nr_seq > len) ? len : nr_seq;
         if (pwrite(dev->fd, handler->data_buf + rdma_offs + offset, rlen, 
             (off_t) lba) == -1) {
-            logmsg(ERROR, "Handler %lu: Failed to read data from device (%d).",
+            logmsg(ERROR, "Handler %lu: Failed to write data to device (%d).",
                    handler->tid, errno);
             return(R_FAILURE);
         }
@@ -2846,6 +2849,7 @@ static void join_handlers(void) {
 int main(int argc, char **argv) {
     int next_opt;                   /* value of next cli option             */
     int wflag = 0;
+    int iflag = 0;
     int rc;                         /* error code for reporting             */
 
     char *logdir   = NULL;          /* directory of log file                */
@@ -2853,7 +2857,7 @@ int main(int argc, char **argv) {
     char *confpath = NULL;          /* path to config file                  */
 
     /* parse command line arguments */
-    while ((next_opt = getopt(argc, argv, ":c:l:wh")) != -1) {
+    while ((next_opt = getopt(argc, argv, ":c:l:whi")) != -1) {
         switch (next_opt) {
             case 'c':
                 confpath = optarg;
@@ -2885,6 +2889,9 @@ int main(int argc, char **argv) {
                 continue;
             case 'w':
                 wflag = 1;
+                continue;
+            case 'i':
+                iflag = 1;
                 continue;
             case ':':
                 fprintf(stderr, "Missing argument for option -%c\n", optopt);
@@ -2974,7 +2981,7 @@ int main(int argc, char **argv) {
 
     /*** !!! ONLY TEMPORARILY FOR TESTING !!! ***/
     /* init first block device with a static stm */
-    if (devs != NULL) {
+    if (devs != NULL && iflag == 1) {
         logmsg(WARN, "Destroying data layout for testing...");
         sstm_init((struct crdss_bdev *) devs->data, 2);
         sstm_mkvslc((struct crdss_bdev *) devs->data);

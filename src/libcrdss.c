@@ -96,7 +96,7 @@ static ssize_t (*libc_pread64)(int, void *, size_t, off_t)        = NULL;
 static ssize_t (*libc_pwrite64)(int, const void *, size_t, off_t) = NULL;
 static int (*libc_xstat64)(int, const char *, struct stat64 *)    = NULL;
 static int (*libc_lxstat64)(int, const char *, struct stat64 *)   = NULL;
-static int (*libc_fstat)(int, struct stat *)                      = NULL;
+static int (*libc_fstat64)(int, int, struct stat64 *)             = NULL;
 static int (*libc_open64)(const char *, int, ...)                 = NULL;
 static int (*libc_fcntl)(int, int, ...)                           = NULL;
 static int (*libc_fdatasync)(int)                                 = NULL;       
@@ -2103,12 +2103,14 @@ int __lxstat64(int ver, const char *path, struct stat64 * stat_buf) {
 }
 
 /* Linux wrapper for stat system calls with file descriptors                */
-int fstat(int fildes, struct stat *buf) {
-    if (libc_fstat == NULL)
-        libc_fstat = dlsym(RTLD_NEXT, "fstat");
+int __fxstat64(int ver, int fildes, struct stat64 *buf) {
+    if (libc_fstat64 == NULL)
+        libc_fstat64 = dlsym(RTLD_NEXT, "__fxstat64");
+    
+    logmsg(DEBUG, "Calling fstat with fd %d.", fildes);
 
     if (fd_table[fildes] == NULL)
-        return(libc_fstat(fildes, buf));
+        return(libc_fstat64(ver, fildes, buf));
    
     logmsg(DEBUG, "Entering custom part of fstat (%d)!", fildes);
     /* else: provide custom values for the crdss file */
@@ -2185,7 +2187,7 @@ int open64(const char *pathname, int flags, ...) {
         return(ret);
     }
 
-    /* fprintf(stderr, "Entering custom part of open64 (%s)!\n", basename); */
+    fprintf(stderr, "Entering custom part of open64 (%s)!\n", basename); 
 
     /* lock fd table to avoid race conditions */
     pthread_mutex_lock(&table_lck);
@@ -2224,7 +2226,7 @@ int open64(const char *pathname, int flags, ...) {
         return(-1);
     }
    
-    /* 
+    /*
     printf("derived cap from file name. didx = %u, sidx = %u\n", 
           pfile->cap.dev_idx, pfile->cap.vslc_idx);
     */
@@ -2268,7 +2270,7 @@ int open64(const char *pathname, int flags, ...) {
         goto fd_err;
     }
 
-    logmsg(INFO, "os_fd is: %d\n", os_fd);
+    fprintf(stderr, "fprintf: os_fd is: %d.\n", os_fd);
     /* set entry in fd table */
     fd_table[os_fd] = pfile;
 
