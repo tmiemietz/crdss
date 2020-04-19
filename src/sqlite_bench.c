@@ -134,7 +134,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Min lat: %lu ns, Max lat: %lu ns, Avg lat: %lu ns\n",
             nano_diffs[0], nano_diffs[NR_RECORDS - 1], 
             array_avg(nano_diffs, NR_RECORDS));
-    fprintf(stderr, "50th: %lu ns, 75th: %lu ns, 95th: %lu ns, 99th %lu ns\n",
+    fprintf(stderr, "1th: %lu ns, 25th: %lu ns, 50th: %lu ns, 75th: %lu ns, "
+            "95th: %lu ns, 99th %lu ns\n",
+            nano_diffs[NR_RECORDS * 1 / 100],
+            nano_diffs[NR_RECORDS * 25 / 100],
             nano_diffs[NR_RECORDS * 50 / 100],
             nano_diffs[NR_RECORDS * 75 / 100],
             nano_diffs[NR_RECORDS * 96 / 100],

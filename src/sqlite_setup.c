@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <sqlite3.h>
 
-#define INSERT_COUNT 2000000
+#define INSERT_COUNT 20000000
 
 static void execute(sqlite3 *db, const char *sql) {
     char *zErrMsg = 0;
@@ -14,6 +14,9 @@ static void execute(sqlite3 *db, const char *sql) {
 }
 
 int main(int argc, char **argv) {
+    char random_data[8192];
+    random_data[8191] = '\0';
+
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <file>\n", argv[0]);
         return(1);
@@ -35,17 +38,20 @@ int main(int argc, char **argv) {
         "T_TEXT         TEXT," \
         "T_INT          INT," \
         "T_CHAR         CHAR(50)," \
-        "T_REAL         REAL" \
+        "T_REAL         REAL," \
+        "T_LCHAR        CHAR(8192)" \
     ");");
 
+    execute(db, "BEGIN TRANSACTION");
     for (int i = 0; i < INSERT_COUNT; ++i) {
-        char tmpsql[256];
+        char tmpsql[9000];
         snprintf(tmpsql, sizeof(tmpsql),
-            "INSERT INTO TEST (ID, T_TEXT, T_INT, T_CHAR, T_REAL)" \
-            "VALUES (%d, 'My text', %d, 'My char', %f);",
-            i + 1, i * 12, i * 3.4f);
+            "INSERT INTO TEST (ID, T_TEXT, T_INT, T_CHAR, T_REAL, T_LCHAR) " \
+            "VALUES (%d, 'My text', %d, 'My char', %f, '%s');",
+            i + 1, i * 12, i * 3.4f, random_data);
         execute(db, tmpsql);
     }
+    execute(db, "END TRANSACTION");
 
     sqlite3_close(db);
     return 0;

@@ -43,7 +43,7 @@
 #define LIBCRDSS_SR_RETRY_INT 10 
 
 /* no. of app threads per completion handler thread for polling completion  */
-#define LIBCRDSS_AT_PER_CW_POLL 2
+#define LIBCRDSS_AT_PER_CW_POLL 4
 
 /* no. of app threads per completion handler thread for blocking completion */
 #define LIBCRDSS_AT_PER_CW_BLOCK 16

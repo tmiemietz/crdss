@@ -1447,7 +1447,7 @@ int fast_read_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         logmsg(DEBUG, "fast_read_raw: sending request to server.");
         while ((ret = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->wid)) == 12){
             /* failed to post send request, but retry once SQ is polled     */
-            usleep(LIBCRDSS_SR_RETRY_INT);
+            /* usleep(LIBCRDSS_SR_RETRY_INT); */
             /* pthread_yield(); */
         }
 
@@ -1565,7 +1565,7 @@ int fast_write_raw(struct crdss_srv_ctx *sctx, uint16_t didx, uint32_t sidx,
         /* trigger the actual request at the server */
         while ((ret = post_msg_sr(&sctx->ibctx, msg_buf, work_ctx->wid)) == 12){
             /* failed to post send request, but retry once SQ is polled     */
-            usleep(LIBCRDSS_SR_RETRY_INT);
+            /* usleep(LIBCRDSS_SR_RETRY_INT); */
             /* pthread_yield(); */
         }
 
@@ -2187,7 +2187,7 @@ int open64(const char *pathname, int flags, ...) {
         return(ret);
     }
 
-    fprintf(stderr, "Entering custom part of open64 (%s)!\n", basename); 
+    /* fprintf(stderr, "Entering custom part of open64 (%s)!\n", basename); */
 
     /* lock fd table to avoid race conditions */
     pthread_mutex_lock(&table_lck);
@@ -2270,7 +2270,7 @@ int open64(const char *pathname, int flags, ...) {
         goto fd_err;
     }
 
-    fprintf(stderr, "fprintf: os_fd is: %d.\n", os_fd);
+    /* fprintf(stderr, "fprintf: os_fd is: %d.\n", os_fd); */
     /* set entry in fd table */
     fd_table[os_fd] = pfile;
 
