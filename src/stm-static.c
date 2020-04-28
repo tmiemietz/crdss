@@ -220,7 +220,7 @@ int sstm_mkvslc(struct crdss_bdev *dev) {
 
     ctx->act_vslc[next_slc_idx] = 1;
     pthread_mutex_unlock(&dev->meta_lck);
-    return(0);
+    return(next_slc_idx);
 }
 
 /* Deletes the vslice with index idx on device dev.                         */
