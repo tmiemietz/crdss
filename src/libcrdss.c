@@ -2114,7 +2114,7 @@ int __fxstat64(int ver, int fildes, struct stat64 *buf) {
    
     logmsg(DEBUG, "Entering custom part of fstat (%d)!", fildes);
     /* else: provide custom values for the crdss file */
-    memset(buf, 0, sizeof(struct stat));
+    memset(buf, 0, sizeof(struct stat64));
  
     if (fd_table[fildes]->size == -1) {
         uint64_t fsize;
@@ -2264,7 +2264,7 @@ int open64(const char *pathname, int flags, ...) {
     /* get backing fd to /dev/null */
     os_fd = libc_open64("/dev/null", O_WRONLY, 0);
     if (os_fd < 0)
-        goto open_err;
+        goto rights_err;
     if (os_fd > (LIBCRDSS_MAX_FD - 1)) {
         printf("Number of open files exceeds limit of libcrdss.\n");
         goto fd_err;
@@ -2334,11 +2334,10 @@ sctx_err:
     fd_table[os_fd] = NULL;
 fd_err:
     close(os_fd);
-open_err:
-    pthread_mutex_unlock(&table_lck);
 rights_err:
     free(pfile);
 file_alloc_err:
+    pthread_mutex_unlock(&table_lck);
     free(basename);
     return(-1);
 }
