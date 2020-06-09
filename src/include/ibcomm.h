@@ -198,11 +198,10 @@ int post_msg_sr(struct ib_ctx *ibctx, unsigned char *msg_addr, uint32_t imm);
  * side with information about which requests has been finished. The caller
  * can request three modes of server-side signaling. If the signaled parameter
  * is 0, no sender-side completion entry will be generated. Mind that an
- * application ahs to send a signaled request from time to time to avoid an
+ * application has to send a signaled request from time to time to avoid an
  * overflow of a queue pair's send queue. In case signaled is 1, a completion
- * queue entry on the server side will be generated. In this case, the 
- * work request ID will be set to the immediate value specified (this is 
- * useful e.g. when waiting for a read operation to finish). If the signaled
+ * queue entry on the server side will be generated. In this case, the work 
+ * request ID will be set to the immediate value specified. If the signaled
  * parameter is 2, a sender side CQE will be generated. However, the work
  * request ID will be branded with the CQE_IGNORE bitmask. Hence, when
  * retrieving completion queue entries via a completion function of this API,

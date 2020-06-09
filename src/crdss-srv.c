@@ -740,6 +740,8 @@ static int handle_drvcap(struct handler *handler, unsigned char *par_id,
     return(R_SUCCESS);
 }
 
+#ifndef CRDSS_DUMMY
+
 /****************************************************************************
  *
  * Handles a client's read request. The function checks whether the caps that
@@ -773,6 +775,7 @@ static int handle_read(struct handler *handler, uint16_t didx, uint32_t sidx,
     logmsg(DEBUG, "Read input params: didx = %u, sidx = %u, addr = %lu, "
            "len = %u.", didx, sidx, addr, len);
 
+#ifndef CRDSS_NOCAP
     /* check whether access is allowed */
     pthread_rwlock_rdlock(&handler->cap_lck);
 
@@ -838,6 +841,7 @@ static int handle_read(struct handler *handler, uint16_t didx, uint32_t sidx,
                "permissions.", handler->tid);
         return(R_PERM);
     }
+#endif /* CRDSS_NOCAP */
 
     lptr = devs;
     for (i = 0; i < didx; i++)
@@ -903,6 +907,7 @@ static int handle_write(struct handler *handler, uint16_t didx, uint32_t sidx,
         return(1);
     }
 
+#ifndef CRDSS_NOCAP
     /* check whether access is allowed */
     pthread_rwlock_rdlock(&handler->cap_lck);
 
@@ -961,6 +966,7 @@ static int handle_write(struct handler *handler, uint16_t didx, uint32_t sidx,
                "permissions of client.", handler->tid);
         return(R_PERM);
     }
+#endif /* CRDSS_NOCAP */
 
     logmsg(DEBUG, "Handler %lu: Executing write request (didx = %u, sidx = %u, "
            "addr = %lu, len = %u).", handler->tid, didx, sidx, addr, len);
@@ -997,6 +1003,8 @@ static int handle_write(struct handler *handler, uint16_t didx, uint32_t sidx,
 
     return(R_SUCCESS);
 }
+
+#endif /* CRDSS_DUMMY */
 
 /****************************************************************************
  *
@@ -1664,6 +1672,9 @@ static void *ib_worker(void *ctx) {
     /* register clean up function for blocking completion notifications     */
     pthread_cleanup_push(&worker_cleanup, handler->ibctx);
 
+    /* initialize op_res here to avoid clobbering warnings                  */
+    op_res = 0;
+
     while (1) {
         if (get_next_msg_type(handler, &msg, &msg_type, &imm) != 0) {
             logmsg(ERROR, "Handler %lu: IB Worker: Error in InfiniBand "
@@ -1854,8 +1865,10 @@ static void *ib_worker(void *ctx) {
                        "is %lu.", handler->tid, rdma_offs, 
                        handler->ibctx->remote_addr);
 
+#ifndef CRDSS_DUMMY
                 op_res = handle_read(handler, device_idx, slice_idx, saddr,
                                      length, rdma_offs);
+#endif
 
                 if (op_res != R_SUCCESS) {
                     /* send error message as an answer */
@@ -1898,13 +1911,15 @@ static void *ib_worker(void *ctx) {
                              (uint64_t) handler->ibctx->remote_addr;
 
                 if (poll_field > (handler->ibctx->rdma_mr->length - 1)) {
-                    logmsg(ERROR, "Handler %lu: Unable to set up poll field", 
+                    logmsg(ERROR, "Handler %lu: Unable to set up DBR", 
                            handler->tid);
                     break;
                 }
 
+#ifndef CRDSS_DUMMY
                 op_res = handle_read(handler, device_idx, slice_idx, saddr,
                                      length, rdma_offs);
+#endif
 
                 if (op_res != R_SUCCESS) {
                     /* write error number to client-side doorbell */
@@ -1916,9 +1931,10 @@ static void *ib_worker(void *ctx) {
                     if (write_poll_field(handler->ibctx, 
                         (uint64_t) handler->data_buf + poll_field,
                         (uint64_t) handler->ibctx->remote_addr + poll_field) != 0){
-                        logmsg(ERROR, "Handler %lu: Failed to write poll field.",
+                        logmsg(ERROR, "Handler %lu: Failed to write DBR.",
                                handler->tid);
                     }
+
                     post_msg_rr(handler->ibctx, msg, 1);
                     break;
                 }
@@ -1926,23 +1942,41 @@ static void *ib_worker(void *ctx) {
                 if (init_rdma_transfer(handler->ibctx, 
                     handler->data_buf + rdma_offs, 
                     (unsigned char *) (handler->ibctx->remote_addr + rdma_offs), 
-                    length, 0, (uint32_t) poll_field, 1) != 0) {
+                    length, 0, 0, 2) != 0) {
                     logmsg(ERROR, "Handler %lu: Sending RDMA request failed.",
                             handler->tid);
                     
                     if (write_poll_field(handler->ibctx, 
                         (uint64_t) handler->data_buf + poll_field,
                         (uint64_t) handler->ibctx->remote_addr + poll_field) != 0){
-                        logmsg(ERROR, "Handler %lu: Failed to write poll field.",
+                        logmsg(ERROR, "Handler %lu: Failed to write DBR.",
                                handler->tid);
                     }
+
                     post_msg_rr(handler->ibctx, msg, 1);
                     break;
                 }
 
+                /* I/O operation successful, write doorbell reg. of client  */
+                *((unsigned char *) handler->data_buf + poll_field) = R_SUCCESS;
+                logmsg(DEBUG, "Handler %lu: Writing remote doorbell %p.",
+                      handler->tid, (void *) ((uint64_t) 
+                      handler->ibctx->remote_addr + poll_field));
+
+                if (write_poll_field(handler->ibctx, 
+                    (uint64_t) handler->data_buf + poll_field,
+                    (uint64_t) handler->ibctx->remote_addr + poll_field) != 0) {
+                    logmsg(ERROR, "Handler %lu: Failed to write remote DBR "
+                           "for fast read completion.", handler->tid);
+                } 
+                else {
+                    logmsg(DEBUG, "Handler %lu: doorbell address written.",
+                           handler->tid);
+                }
+
                 /* recycle recv request */
                 post_msg_rr(handler->ibctx, msg, 1);
-
+                
                 break;
             case MTYPE_WRITE:
                 /* write data transferred by client to disk                 */
@@ -1960,8 +1994,10 @@ static void *ib_worker(void *ctx) {
                 rdma_offs  = be64toh(*((uint64_t *) (msg + 19))) - 
                              (uint64_t) handler->ibctx->remote_addr;
 
+#ifndef CRDSS_DUMMY
                 op_res = handle_write(handler, device_idx, slice_idx, saddr,
                                       length, rdma_offs);
+#endif
 
                 /* regardless of the outcome of the operation, send the     *
                  * status and the rdma offset (for identification on clt    *
@@ -1989,14 +2025,16 @@ static void *ib_worker(void *ctx) {
                 rdma_offs  = be64toh(*((uint64_t *) (msg + 19))) - 
                              (uint64_t) handler->ibctx->remote_addr;
 
+#ifndef CRDSS_DUMMY
                 op_res = handle_write(handler, device_idx, slice_idx, saddr,
                                       length, rdma_offs);
+#endif
 
                 /* rdma offset now becomes offset for poll field */
                 poll_field = be64toh(*((uint64_t *) (msg + 27))) - 
                              (uint64_t) handler->ibctx->remote_addr;
                 if (poll_field > (handler->ibctx->rdma_mr->length - 1)) {
-                    logmsg(ERROR, "Handler %lu: Invalid poll field in write.",
+                    logmsg(ERROR, "Handler %lu: Invalid DBR in write.",
                            handler->tid);
                     op_res = R_INVAL;
                 }
@@ -2005,35 +2043,12 @@ static void *ib_worker(void *ctx) {
                 if (write_poll_field(handler->ibctx, 
                     (uint64_t) handler->data_buf + poll_field,
                     (uint64_t) handler->ibctx->remote_addr + poll_field) != 0) {
-                    logmsg(ERROR, "Handler %lu: Failed to write poll field.",
+                    logmsg(ERROR, "Handler %lu: Failed to write remote DBR.",
                            handler->tid);
                 }
 
                 /* recycle recv request */
                 post_msg_rr(handler->ibctx, msg, 1);
-                break;
-            case MTYPE_COMPLETE:
-                /* completion request for fast read, now write poll field   */
-                logmsg(DEBUG, "Handler %lu: Completed RDMA tansfer for fast "
-                       "read request (imm = %u).", handler->tid, imm);
-
-                /* entry found, write poll field of client */
-                *((unsigned char *) handler->data_buf + imm) = R_SUCCESS;
-                logmsg(DEBUG, "Handler %lu: Writing remote doorbell %p.",
-                      handler->tid, 
-                      (void *) ((uint64_t) handler->ibctx->remote_addr + imm));
-
-                if (write_poll_field(handler->ibctx, 
-                    (uint64_t) handler->data_buf + imm,
-                    (uint64_t) handler->ibctx->remote_addr + imm) != 0) {
-                    logmsg(ERROR, "Handler %lu: Failed to write poll field "
-                           "for fast read completion.", handler->tid);
-                } 
-                else {
-                    logmsg(DEBUG, "Handler %lu: doorbell address written.",
-                           handler->tid);
-                }
-
                 break;
             case MTYPE_CPOLL:
                 handler->use_poll = 1;

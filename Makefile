@@ -31,15 +31,19 @@ crdss-srv: obj/crdss-srv.o $(filter-out $(TGTOBJS), $(OBJECTS))
 	@echo "Linking $@..."
 	$(CC) -pedantic -o $(TGTDIR)/$@ $^ $(LIBS)
 
-crdss-srv-nocap: obj/crdss-srv-nocap.o $(filter-out $(TGTOBJS), $(OBJECTS))
+crdss-srv-nocap: $(filter-out $(TGTOBJS), $(OBJECTS))
 	@mkdir -p $(TGTDIR)
+	@echo "Building special binary for $@..."
+	$(CC) -c $(CFLAGS) -D CRDSS_NOCAP -o $(OBJDIR)/$@.o $(SRCDIR)/crdss-srv.c
 	@echo "Linking $@..."
-	$(CC) -pedantic -o $(TGTDIR)/$@ $^ $(LIBS)
+	$(CC) -pedantic -o $(TGTDIR)/$@ $(OBJDIR)/$@.o $^ $(LIBS)
 
-crdss-srv-dummy: obj/crdss-srv-dummy.o $(filter-out $(TGTOBJS), $(OBJECTS))
+crdss-srv-dummy: $(filter-out $(TGTOBJS), $(OBJECTS))
 	@mkdir -p $(TGTDIR)
+	@echo "Building special binary for $@..."
+	$(CC) -c $(CFLAGS) -D CRDSS_DUMMY -o $(OBJDIR)/$@.o $(SRCDIR)/crdss-srv.c
 	@echo "Linking $@..."
-	$(CC) -pedantic -o $(TGTDIR)/$@ $^ $(LIBS)
+	$(CC) -pedantic -o $(TGTDIR)/$@ $(OBJDIR)/$@.o $^ $(LIBS)
 
 crdss-capmgr: obj/crdss-capmgr.o $(filter-out $(TGTOBJS), $(OBJECTS))
 	@mkdir -p $(TGTDIR)
@@ -94,6 +98,6 @@ $(OBJDIR)/%.o: $(SOURCES) $(HEADERS)
 .PHONY: clean
 
 clean:
-	rm -f $(OBJECTS)
+	rm -f $(wildcard $(OBJDIR)/*)
 	rm -f $(wildcard $(TGTDIR)/*)
 	rm -f lib/*

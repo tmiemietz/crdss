@@ -49,7 +49,8 @@
 #define MTYPE_IBCLOSE   0x10                /* close IB connection          */
 
 /* messages for data exchange */
-#define MTYPE_COMPLETE  0x20                /* data transfer is complete    */
+#define MTYPE_COMPLETE  0x20                /* data transfer is complete    *
+                                             * field is deprecated!         */
 #define MTYPE_READ      0x21
 #define MTYPE_FASTREAD  0x22                /* read with polling at client  */
 #define MTYPE_WRITE     0x23
