@@ -1,0 +1,161 @@
+#! /usr/bin/ksh
+
+#
+# Transforms fio output into a csv that can be used for boxplots
+#
+
+if [ $# -lt 1 ]
+  then
+  echo "Provide target directory!"
+  exit 1
+fi
+
+L4K=""
+L16K=""
+L64K=""
+L256K=""
+L1024K=""
+
+echo "bs,bw,iops,min,q1,q25,q50,q75,q99,max" > $1/latstat.csv
+
+for OUTFILE in `find $1 -name "*.out"`
+  do
+  echo "file: $OUTFILE"
+  BS=${OUTFILE%.*}
+  BS=${BS##*_}
+
+  OUT=`cat $OUTFILE | awk -v bs="$BS" '
+          BEGIN { bw = 0; iops = 0; lat_min = -1; lat_max = 0; q1 = 0;
+                  q25 = 0; q50 = 0; q75 = 0; q99 = 0; perc_mode = 0; }
+ 
+          $1 == "write:" || $1 == "read:" {
+                  sub("IOPS=", "", $2);
+
+                  # handle suffix of IOPS counter
+                  unitchar = substr($2, length($2) - 1, 1);
+                  if (unitchar == "k") {
+                      sub("k,", "", $2);
+                      $2 = $2 * 1000;
+                  }
+
+                  iops = iops + $2;
+          }
+
+          $1 == "lat" && $2 == "(usec):" {
+              sub("min=", "", $3);
+              sub("max=", "", $4);
+              sub(",", "", $3);
+              sub(",", "", $4);
+
+              if (lat_min == -1 || $3 < lat_min)
+                  lat_min = $3;
+        
+              if (lat_max < $4)
+                  lat_max = $4;
+        
+          }
+
+          $1 == "lat" && $2 == "(msec):" {
+              sub("min=", "", $3);
+              sub("max=", "", $4);
+              sub(",", "", $3);
+              sub(",", "", $4);
+
+              $3 = $3 * 1000;
+              $4 = $4 * 1000;
+
+              if (lat_min == -1 || $3 < lat_min)
+                  lat_min = $3;
+
+              if (lat_max < $4)
+                  lat_max = $4;
+          }
+
+          $1 == "lat" && $2 == "percentiles" {
+              if ($3 == "(nsec):") {
+                  perc_mode = 1;
+              }
+              else {
+                  perc_mode = 0;
+              }
+          }
+
+          $2 ~ /^1.0th=.*/ {
+              if (perc_mode == 1) {
+                  sub("1\\\\.0th=\\\\[", "", $2);
+                  sub("],", "", $2);
+                  q1 = $2 / 1000;
+              }
+              else {
+                  sub("],", "", $3);
+                  q1 = $3;
+              }
+          }
+
+          $2 ~ /^99.0th=.*/ {
+              if (perc_mode == 1) {
+                  sub("99\\\\.0th=\\\\[", "", $2);
+                  sub("]", "", $2);
+                  q99 = $2 / 1000;
+              }
+              else {
+                  sub("]", "", $3);
+                  q99 = $3;
+              }
+          }
+
+          $3 ~ /^25.0th=.*/ {
+              if (perc_mode == 1) {
+                  sub("25\\\\.0th=\\\\[", "", $3);
+                  sub("],", "", $3);
+                  q25 = $3 / 1000;
+              }
+          }
+          
+          $4 ~ /^50.0th=.*/ {
+              if (perc_mode == 1) {
+                  sub("50\\\\.0th=\\\\[", "", $4);
+                  sub("],", "", $4);
+                  q50 = $4 / 1000;
+              }
+          }
+          
+          $5 ~ /^75.0th=.*/ {
+              if (perc_mode == 1) {
+                  sub("75\\\\.0th=\\\\[", "", $5);
+                  sub("],", "", $5);
+                  q75 = $5 / 1000;
+              }
+          }
+          
+          $8 == "75.0th=[" { sub("],", "", $9); q75 = $9; }
+          $6 == "50.0th=[" { sub("],", "", $7); q50 = $7; }
+          $4 == "25.0th=[" { sub("],", "", $5); q25 = $5; }
+
+          $1 == "WRITE:" || $1 == "READ:" {
+                  sub("MiB/s", "", $2);
+                  bw = bw + substr($2, 4);
+          }
+
+          END {
+              print(bs "," bw "," iops "," lat_min "," q1 "," q25 "," \
+                    q50 "," q75 "," q99 "," lat_max);
+          }
+  '`
+
+  case "$BS" in
+    "4k") L4K="$OUT";;
+    "16k") L16K="$OUT";;
+    "64k") L64K="$OUT";;
+    "256k") L256K="$OUT";;
+    "1024k") L1024K="$OUT";;
+  esac
+done
+
+[ -n "$L4K" ] && echo "$L4K" >> $1/latstat.csv
+[ -n "$L16K" ] && echo "$L16K" >> $1/latstat.csv
+[ -n "$L64K" ] && echo "$L64K" >> $1/latstat.csv
+[ -n "$L256K" ] && echo "$L256K" >> $1/latstat.csv
+[ -n "$L1024K" ] && echo "$L1024K" >> $1/latstat.csv
+
+exit 0

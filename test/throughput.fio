@@ -1,0 +1,22 @@
+# Benchmark file for the maximum throughput tests of diffrent I/O schedulers.
+#
+# Copyright (c) 2019 Till Miemietz
+
+[global]
+    filename=%D        # file operated upon
+    rw=%M
+    bs=%B
+    ioengine=psync               # simulate background threads with aio for
+    runtime=30                   # time limit for benchmark in seconds
+    time_based=1                 # loop over workload if finished before runtime
+    thread=1                     # create threads instead of forking
+    direct=1                     # direct I/O to compute realistic values
+    lat_percentiles=1            # enable latency percentiles
+
+[bgload1]
+    name=bgload1
+    numjobs=%T                   # no. of instances to spawn for this workload
+                                 # maximum stressing of the SSD
+    offset_increment=2g
+    size=%S		         # only use the first half of the disk since the
+                                 # remaining storage is trimmed

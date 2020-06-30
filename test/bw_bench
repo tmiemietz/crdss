@@ -1,0 +1,188 @@
+#! /usr/bin/ksh
+
+
+#
+# Benchmark for testing single-thread latency of requests.
+#
+
+DEVNAME="crdss-10.10.10.1-0-0"
+
+LIBCRDSS_PATH="/home/ib/crdss/libcrdss.so"
+LIBCRDSS_CFG_PATH="/home/ib/crdss/libcrdss.cfg"
+
+# root directory for all benchmark results. Change this to dump result files
+# at another location. Make sure that you have write permissions for the 
+# directory specified.
+DATE=`date +%Y%m%d%H%M%S`
+if [ $# -gt 0 ]
+  then
+  BASEDIR="/home/ib/crdss/bench/bw_bench_$1_$DATE"
+else
+  BASEDIR="/home/ib/crdss/bench/bw_bench_$DATE"
+fi
+
+# the operation modes for which the throughput should be tested. See the line
+# below for a collection of possible workload profiles. For more variety, refer
+# to the documentation of fio.
+# MODES="read randread randwrite write randrw"
+MODES="read"
+
+# block sizes tested
+BSIZES="4k"
+
+# number of threads to use for I/O tests (here always 1)
+TCNT="64"
+
+################################################################################
+#                         START OF ACTUAL SCRIPT                               #
+################################################################################
+
+DEV_BASENAME=`basename $DEVNAME`
+echo "DEV_BASENAME is $DEV_BASENAME"
+
+for MODE in $MODES
+  do
+  WDIR=${BASEDIR}/${MODE}
+  mkdir -p $WDIR
+
+  RES_CSV=${WDIR}/res_${MODE}.csv
+  echo "bs,tcnt,bw,iops,lat-min,lat-max,lat-avg" > $RES_CSV
+
+  for BS in $BSIZES
+    do
+
+    for THREADS in $TCNT
+      do
+      # announce new test case
+      echo
+      echo "###" 
+      echo "BWBENCH FOR $DEVNAME: MODE $MODE - BS $BS - TCNT $THREADS"
+      echo "###"
+      echo
+
+      # set library thread count to one for latenyc tests
+      if [[ "$DEV_BASENAME" == crdss* ]]
+        then
+        LIBCFG=`cat $LIBCRDSS_CFG_PATH | awk -v t="${THREADS}" '
+                $1 == "no_workers" { print("no_workers = " t); next; }
+
+	        { print($0); }
+        '`
+        echo "$LIBCFG" > $LIBCRDSS_CFG_PATH
+      fi
+
+      BENCHFILE="bwbench_${MODE}_${BS}_T${THREADS}.fio"
+      OUTFILE="bwbench_${MODE}_${BS}_T${THREADS}.out"
+
+      # prepare template for current run by substituting placeholders
+      TEMPLATE=`cat throughput.fio | awk -v b="$BS" -v m="$MODE" \
+               -v d="${DEVNAME}" -v t="${THREADS}" '
+               { gsub("%M", m); gsub("%B", b); gsub("%D", d); 
+	         gsub("%T", t); print $0; }
+      '`
+      # delete per-job offset option for random I/O (since it is random anyways)
+      if [[ "$MODE" == "randread" || "$MODE" == "randwrite" ]]
+        then
+        TEMPLATE=`echo "$TEMPLATE" | awk '
+            { gsub("offset_increment=2g", ""); print($0); }
+        '`
+      fi
+      if [[ "$DEV_BASENAME" == crdss* ]]
+        then
+        TEMPLATE=`echo "$TEMPLATE" | awk '
+            { gsub("%S", "100%"); print($0); }
+        '`
+      else 
+        TEMPLATE=`echo "$TEMPLATE" | awk '
+            { gsub("%S", "50%"); print($0); }
+        '`
+      fi
+      echo "$TEMPLATE" > $WDIR/$BENCHFILE
+
+      if [[ "$DEV_BASENAME" == crdss* ]]
+        then
+        echo "Using custom library for CRDSS device."
+        LD_PRELOAD=$LIBCRDSS_PATH fio $WDIR/$BENCHFILE > $WDIR/$OUTFILE
+      else
+        fio $WDIR/$BENCHFILE > $WDIR/$OUTFILE
+      fi
+
+      RES_LINE=`cat $WDIR/$OUTFILE | awk -v bs="$BS" -v tcnt="$THREADS" '
+          BEGIN { bw = 0; iops = 0; lat_min = -1; lat_max = 0; lat_avg = 0; }
+ 
+	  $1 == "write:" || $1 == "read:" {
+                  sub("IOPS=", "", $2);
+
+                  # handle suffix of IOPS counter
+		  unitchar = substr($2, length($2) - 1, 1);
+                  if (unitchar == "k") {
+                      sub("k,", "", $2);
+		      $2 = $2 * 1000;
+                  }
+
+                  iops = iops + $2;
+          }
+
+	  $1 == "lat" && $2 == "(usec):" {
+              sub("min=", "", $3);
+	      sub("max=", "", $4);
+	      sub("avg=", "", $5);
+              sub(",", "", $3);
+	      sub(",", "", $4);
+	      sub(",", "", $5);
+
+	      if (lat_min == -1 || $3 < lat_min)
+	          lat_min = $3;
+	
+	      if (lat_max < $4)
+	          lat_max = $4;
+	
+	      lat_avg = lat_avg + $5;
+	  }
+
+	  $1 == "lat" && $2 == "(msec):" {
+              sub("min=", "", $3);
+	      sub("max=", "", $4);
+	      sub("avg=", "", $5);
+              sub(",", "", $3);
+	      sub(",", "", $4);
+	      sub(",", "", $5);
+
+	      $3 = $3 * 1000;
+	      $4 = $4 * 1000;
+	      $5 = $5 * 1000;
+
+	      if (lat_min == -1 || $3 < lat_min)
+	          lat_min = $3;
+	
+	      if (lat_max < $4)
+	          lat_max = $4;
+	
+	      lat_avg = lat_avg + $5;
+	  }
+	
+	  $1 == "WRITE:" || $1 == "READ:" {
+                  sub("MiB/s", "", $2);
+                  bw = bw + substr($2, 4);
+          }
+
+	  END {
+	      lat_avg = lat_avg / tcnt;    
+	      print(bs "," tcnt "," bw "," iops "," lat_min "," lat_max "," \ 
+	            lat_avg); 
+          }
+      '`
+      echo "$RES_LINE" >> $RES_CSV
+
+      # drop page caches if we are using NVMe stuff (executed as root anyways)
+      if [[ "$DEV_BASENAME" != crdss* ]]
+        then
+        sync
+        echo 1 > /proc/sys/vm/drop_caches
+      fi
+
+      # wait some time to cool down the drive
+      sleep 30
+    done
+  done
+done
