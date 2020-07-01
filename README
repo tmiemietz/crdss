@@ -1,1 +1,239 @@
-Sample text for README.
+################################################################################
+#                                                                              #
+#                                 CRDSS                                        #
+#                                   -                                          #
+#                        A Remote Storage Service                              #
+#         Combining Direct Access and Fine-Grained Access Control              #
+#                                                                              #
+################################################################################
+
+
+CRDSS is a service that offers direct access to remote block devices while 
+retaining a fine-grained access control. Direct access here means that 
+applications that execute remote I/O requests via this service can do so without 
+interacting with their local operating system kernel. The fine-grained access
+control mechanism is implemented by means of a capability system. Several 
+technical insights as well as an extended discussion of the framework can be 
+found in the Diploma thesis "RDMA-Based Access to NVMe Storage with Fine-Grained
+Access Control" (TU Dresden, 2020). This README only covers basic steps for
+getting started with this framework.
+
+
+Components Included
+-------------------
+
+crdss-srv    - The server component of the system. Each storage node runs an
+               instance of this daemon.
+
+crdss-capmgr - The capability manager is executed once on each application node.
+               It is responsible for identifying client applications and 
+               creating new capabilities on their behalf (i.e. bootstrapping
+               the capability system by means of its configuration file)
+
+libcrdss     - A client library for using the CRDSS service. Beside its native
+               CRDSS interface, this library also comprises emulations for a
+               subset of the POSIX block I/O functions. Currently implemented
+               POSIX routines are: open64, pread64, pwrite64, stat, fstat,
+               lstat and fdatasync.
+
+A brief guide on how to use the storage server and the capability manager can
+be obtained by passing -h as a command line switch. Applications that want
+to use libcrdss may simply link to it. Make sure that the library is present
+during run time. On Linux, this may require setting the LD_LIBRARY_PATH variable
+accordingly. In order to execute POSIX-compliant applications with the CRDSS 
+service, the LD_PRELOAD facility of the GNU linker can be used. Keep in mind 
+that libcrdss currently only supports a subset of the POSIX block I/O interface.
+Running applications that use both POSIX functions that are intercepted by
+libcrdss and functions that are executed natively by the C library may lead 
+to undefined behavior.
+
+Beside these core components, there exist several testing applications for
+verifying the basic API (testclt), for loading and retrieving regular files 
+into or from a CRDSS volume (crdss-cp and crdss-rd), and for benchmarking
+purposes (gap_read, gap_read_cap, sqlite_setup, sqlite_bench).
+
+
+Compiling the Source Code / Prerequisites
+-----------------------------------------
+
+For running the service, you need networking hardware that is capable of
+performing RDMA operations and that can be used by means of the ibverbs
+library. The service will only run on Linux-based operating systems, as it
+uses some header files and library features that are not compliant with the
+POSIX standard. You should furthermore verify that a C compiler and the
+associated tools such as make are present on your system.
+
+Required libraries: libc, libibverbs, libsodium
+
+To build the project, enter the root directory of this repository and type:
+
+make
+
+Along with the build process, several subdirectories will be created. All
+object files created during the compilation process can be found in the
+obj directory. The final products of the build process are located in the
+bin directory (binaries) and in the lib directory (libcrdss.so only).
+
+To remove any generated file, enter the root directory of this repo and type:
+
+make clean
+
+
+Syntax of the Configuration Files
+---------------------------------
+
+Each component of the CRDSS system uses a configuration file for setting up its
+internal data structures. Both the server and the capability manager take the
+path to their configuration file as a command line argument, the library either
+takes a path to a configuration file as an argument to its initialization 
+routine or looks up for such a file under a fixed, compile-time-defined path
+that can be set in src/include/libcrdss.h.
+All configuration files follow a syntax that is similar to init files. They
+consist of multiple blocks of the form:
+
+[<block name>]
+    <key> = <value list>
+    ...
+
+Each block can have multiple key-value pairs. All lines starting with the
+'#' character are ignored. If a key is assigned multiple values, these values 
+shall be separated by a space character (' '). Key names within a single block
+have to be unique.
+
+
+Configuration File for Servers
+------------------------------
+
+A valid configuration file for an instance of a CRDSS server has to contain
+exactly one server block (block name "SERVER"). Each capability manager the 
+respective server needs to know is described with an snic block (block name
+"SNIC").
+
+Valid keys for the [SERVER] block:
+    addr     - IPv4 address the respective server process shall bind to.
+               (mandatory)
+    port     - Port number the respective server process shall bind to.
+               (mandatory)
+    secret   - Password that the server will send for authentication with
+               remote capability managers.
+               (mandatory)
+    devices  - Space-separated list of block devices (e.g. /dev/nvme0n1) that 
+               the server uses as backing storage.
+               (mandatory, at least one device name must be given)
+    guid     - GUID of the InfiniBand network port that the server shall use 
+               for RDMA-based communication.
+               (mandatory)
+    loglevel - Logging level of the server. Possible values are "severe", 
+               "error", "warn", "info", and "debug". If no log level is given,
+               the server uses the info loglevel.
+               (optional)
+
+Valid keys for the [SNIC] block (all keys are mandatory):
+    addr   - IPv4 address of the respective capability manager.
+    port   - Port number of the respective capability manager.
+    secret - Password that this capability manager will use for verifying its
+             identity.
+
+
+Configuration File for Capability Managers
+------------------------------------------
+
+The configuration file of a capability manager has to contain exactly one
+global (block name "GLOBAL") and at least one server (block name "SERVER")
+block. Each capability that the respective manager shall grant to client
+applications running on its machine has to be described with a separated
+cap block (block name "CAP").
+
+Valid keys for the [GLOBAL] block:
+    addr     - IPv4 address the capability manager shall bind to.
+               (mandatory)
+    secret   - Password that this instance of the capability manager uses for
+               authentication with its configured storage servers.
+               (mandatory)
+    domsock  - Domain socket that this capability manager will create for
+               communicating with its local clients.
+               (mandatory)
+    loglevel - Logging level of the daemon. Possible values are "severe", 
+               "error", "warn", "info", and "debug". If no log level is given,
+               the capability manager uses the info loglevel.
+               (optional)
+
+Valid keys for a [SERVER] block (all keys are mandatory):
+    addr   - IPv4 address of the respective server.
+    port   - Port on that the respective server listens.
+    lport  - Local port that the capability manager shall use for communicating
+             with the respective server.
+    secret - Password the server is expected to use for authentication.
+
+Valid keys for a [CAP] block (all keys are mandatory):
+    server     - IPv4 address of the server on that this capability can be
+                 created.
+    dev_idx    - Index of the device this capability can be used for.
+    vslc_idx   - Index of the virtual slice this capability can be used for.
+    start_addr - Start address of the capability (in Bytes).
+    end_addr   - End address of the capability (in Bytes).
+    rights     - Access rights covered by this capability. Possible values
+                 are "read", "write", or a combination of both for read/write
+                 access.
+    uid        - UID of the user that may create the this capability by means of
+                 the controlling capability manager.
+    key        - Identifier used for distinguishing between multiple 
+                 capabilities for a single user.
+
+
+Configuration File for libcrdss
+-------------------------------
+
+The configuration file of the library consists only of a single lib (block name
+"LIB") block. As mentioned before, an application can override the system-wide
+default configuration upon library initialization by passing a configuration
+structure with custom values.
+
+Valid keys for the [LIB] block (all keys are mandatory):
+    no_workers - Number of worker threads that the library expects to issue
+                 I/O requests. This field should be set to the expected 
+                 number of application threads that will use the CRDSS service
+                 in parallel.
+    sbuf_size  - Size of the small buffers (in KiB). libcrdss allocates one 
+                 small buffer per registered application thread.
+    lbuf_size  - Size of the large buffers (in KiB).
+    lbuf_cnt   - Number of large buffer to allocate and register with the
+                 RDMA networking hardware.
+    use_poll   - If this value does not equal 0, the library will actively
+                 poll for completion notification on outstanding I/O requests.
+                 Note that polling consumes a lot of CPU resources.
+
+
+Running Benchmarks with fio
+---------------------------
+
+The test directory of this repository contains two benchmarking scripts that
+measure latency and throughput for different workload types and block sizes.
+In order to run those scripts you need to install the Korn shell, awk and
+fio (tested with version 3.10).
+
+The scripts can be configured by adjusting the shell variables at the beginning
+of the respective files. Each combination of workload type, block size and
+thread count is then tested. Note that the latency test always uses a single
+thread, so changing the corresponding variable is pointless. The name of the 
+workload types is the same as for fio. The same holds for the notation of block 
+sizes. For more information, refer to the respective code.
+
+When executing the benchmark scripts, make sure that the respective fio 
+benchmark template file are located in the same directory as the benchmark 
+script (throughput.fio for bw_bench and st-latency for lat_bench). Both
+benchmark scripts create a directory tree with the output data of fio.
+In the case of the throughput benchmark, there is a summarizing CSV file that
+can be used for plotting later on. For the latency benchmarks, this file
+has to be create by means of the mklatcsv script. Furthermore, this 
+repository contains multiple R scripts for creating publication-ready plots 
+from the resulting CSV files.
+
+
+Known Issues
+------------
+
+Currently, the GUID of the InfiniBand device that the client library uses is
+hard-coded via a define in libcrdss.h. Consequently, the library has to be 
+re-built for every machine it shall run on. This issue will be fixed in the
+future.
